@@ -144,6 +144,22 @@ def test_the_mode_is_the_one_of_the_image_whatever_the_checkout_has(build):
         assert oct((build.notes / name).stat().st_mode & 0o7777) == "0o644", name
 
 
+def test_what_we_replace_keeps_the_mode_it_had_in_the_image(build):
+    import py_compile
+
+    (build.site / "pkg/old.py").chmod(0o664)
+    had = Path(py_compile.compile(str(build.site / "pkg/old.py"), doraise=True))
+    had.chmod(0o664)
+
+    assert build.run(umask=0o077).returncode == 0
+
+    assert (build.site / "pkg/old.py").read_text() == "X = 'ours'\n"
+    assert oct((build.site / "pkg/old.py").stat().st_mode & 0o7777) == "0o664"
+    assert oct(had.stat().st_mode & 0o7777) == "0o664"
+    assert inside_check.bytecode_trouble(str(build.site / "pkg/old.py"), str(had)) is None
+    assert oct((build.site / "pkg/new.py").stat().st_mode & 0o7777) == "0o644"
+
+
 def test_the_notes_say_what_was_laid_over_and_of_what_version(build):
     assert build.run(version="0.4.12-piqnyx.1").returncode == 0
 

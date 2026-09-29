@@ -62,12 +62,16 @@ class Build:
         path.chmod(mode)
         return path
 
-    def run(self, version="0.0.0-test.1"):
+    def untouched(self):
+        return (self.site / "pkg/old.py").read_text() == "X = 'as the image had it'\n"
+
+    def run(self, version="0.0.0-test.1", umask=0o022):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
         env.pop("SOURCE_DATE_EPOCH", None)
         return subprocess.run(
             ["sh", str(SCRIPT), str(self.source), str(self.site), version, str(self.notes)],
             env=env,
+            preexec_fn=lambda: os.umask(umask),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -126,7 +130,7 @@ def test_the_mode_is_the_one_of_the_image_whatever_the_checkout_has(build):
     (build.source / "pkg/old.py").chmod(0o600)
     (build.source / "pkg/new.py").chmod(0o664)
 
-    assert build.run().returncode == 0
+    assert build.run(umask=0o077).returncode == 0
 
     tag = sys.implementation.cache_tag
     for name in (
@@ -136,6 +140,8 @@ def test_the_mode_is_the_one_of_the_image_whatever_the_checkout_has(build):
         f"pkg/__pycache__/new.{tag}.pyc",
     ):
         assert oct((build.site / name).stat().st_mode & 0o7777) == "0o644", name
+    for name in ("PIQNYX-OVERLAY.txt", "PIQNYX-VERSION"):
+        assert oct((build.notes / name).stat().st_mode & 0o7777) == "0o644", name
 
 
 def test_the_notes_say_what_was_laid_over_and_of_what_version(build):
@@ -155,14 +161,16 @@ def test_blank_lines_and_a_last_line_without_an_end_are_read_right(build):
     assert (build.site / "pkg/new.py").read_text() == "Z = 'ours, new'\n"
 
 
-def test_a_file_of_the_list_that_the_checkout_lacks_stops_the_build(build):
-    build.put(build.list, "pkg/old.py\npkg/gone.py\n")
+@pytest.mark.parametrize("name", ["pkg/gone.py", "pkg/gone.yaml"])
+def test_a_file_of_the_list_that_the_checkout_lacks_stops_the_build(build, name):
+    build.put(build.list, f"pkg/old.py\n{name}\n")
 
     done = build.run()
 
     assert done.returncode != 0
-    assert "pkg/gone.py" in done.stderr
+    assert "нет файла" in done.stderr and name in done.stderr
     assert not (build.notes / "PIQNYX-VERSION").exists()
+    assert build.untouched()
 
 
 def test_a_file_that_does_not_compile_stops_the_build(build):
@@ -173,6 +181,7 @@ def test_a_file_that_does_not_compile_stops_the_build(build):
     assert done.returncode != 0
     assert "pkg/new.py" in done.stderr
     assert not (build.notes / "PIQNYX-VERSION").exists()
+    assert build.untouched()
 
 
 @pytest.mark.parametrize("text", ["", "\n\n"])
@@ -196,6 +205,7 @@ def test_a_name_that_leads_out_of_the_packages_stops_the_build(build, name):
     assert done.returncode != 0
     assert "вон" in done.stderr
     assert not (build.site.parent / "outside.py").exists()
+    assert build.untouched()
 
 
 def test_a_build_without_a_version_stops(build):
@@ -204,7 +214,7 @@ def test_a_build_without_a_version_stops(build):
     assert done.returncode != 0
     assert "верси" in done.stderr
     assert not (build.notes / "PIQNYX-VERSION").exists()
-    assert (build.site / "pkg/old.py").read_text() == "X = 'as the image had it'\n"
+    assert build.untouched()
 
 
 def test_a_site_that_is_not_there_stops_the_build(build):

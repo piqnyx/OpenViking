@@ -46,14 +46,25 @@ while IFS= read -r name || [ -n "$name" ]; do
 done < "$list"
 [ "$count" -gt 0 ] || stop "список наших файлов пуст: $list"
 
+# What we replace keeps the mode it had in the image; what is new is given 0644.
+mode_of() {
+    if [ -f "$1" ]; then stat -c '%a' "$1"; else echo 0644; fi
+}
+
 while IFS= read -r name || [ -n "$name" ]; do
     [ -n "$name" ] || continue
-    install -D -m 0644 "$src/$name" "$site/$name"
+    mode=$(mode_of "$site/$name")
+    install -D -m "$mode" "$src/$name" "$site/$name"
     case "$name" in
         *.py)
+            compiled=$(python -B -c \
+                'import importlib.util, sys; print(importlib.util.cache_from_source(sys.argv[1]))' \
+                "$site/$name")
+            mode=$(mode_of "$compiled")
             # -B: no bytecode is written but the one asked for here.
             python -B -c 'import py_compile, sys; py_compile.compile(sys.argv[1], doraise=True)' \
                 "$site/$name"
+            chmod "$mode" "$compiled"
             ;;
     esac
 done < "$list"

@@ -7,7 +7,8 @@ Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cachepro
 
 import hashlib
 import importlib.util
-import os
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("compare_images", HERE.parent / "compare_images.py")
 compare_images = importlib.util.module_from_spec(spec)
+# Dataclasses look their module up by name while the class is being made.
+sys.modules["compare_images"] = compare_images
 spec.loader.exec_module(compare_images)
 
 SITE = "/app/.venv/lib/python3.13/site-packages"
@@ -66,12 +69,43 @@ class Images:
         self.new["/app/PIQNYX-VERSION"] = ("0.4.12-piqnyx.1\n", "644", "0:0")
         self.new["/etc/hostname"] = ("new-host", "644", "0:0")
 
+        # What the tag holds of the two packages, as `git archive` gives it.
+        self.tag = tmp_path / "tag"
+        self.tag_files = {
+            "openviking/session/session.py": "session, upstream",
+            "openviking/utils/model_retry.py": "retry, upstream",
+            "openviking/docs/only-in-the-source.md": "never installed",
+        }
+        for name, text in self.tag_files.items():
+            path = self.tag / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+        self.old_config = {
+            "User": "",
+            "Entrypoint": ["openviking-entrypoint"],
+            "Cmd": None,
+            "WorkingDir": "/app",
+            "Env": ["HOME=/app", "OPENVIKING_CONFIG_FILE=/app/.openviking/ov.conf"],
+            "ExposedPorts": {"1933/tcp": {}},
+            "Healthcheck": {"Test": ["CMD", "openviking-entrypoint", "--healthcheck"]},
+            "Labels": {"org.opencontainers.image.source": "upstream"},
+            "Image": "sha256:old",
+        }
+        self.new_config = dict(
+            self.old_config,
+            Labels={"org.opencontainers.image.source": "upstream", "org.piqnyx.version": "1"},
+            Image="sha256:new",
+        )
+
     def report(self, overlay=OURS):
         def files(image):
             return "".join(f"{digest(text)}  {path}\n" for path, (text, _, _) in image.items())
 
         def entries(image):
-            return "".join(f"f\t{mode}\t{owner}\t{path}\t\n" for path, (_, mode, owner) in image.items())
+            return "".join(
+                f"f\t{mode}\t{owner}\t{path}\t\n" for path, (_, mode, owner) in image.items()
+            )
 
         return compare_images.compare(
             old_files=files(self.old),
@@ -82,6 +116,11 @@ class Images:
             site=SITE,
             cache_tag=TAG,
             source_root=str(self.root),
+            tag_root=str(self.tag),
+            old_config=json.dumps(self.old_config),
+            new_config=(
+                self.new_config if isinstance(self.new_config, str) else json.dumps(self.new_config)
+            ),
         )
 
 
@@ -152,7 +191,9 @@ def test_our_file_missing_from_the_image_stops_the_work(images):
     report = images.report()
 
     assert not report.ok
-    assert any("нет в образе" in line and "piqnyx_persistence.py" in line for line in report.problems)
+    assert any(
+        "нет в образе" in line and "piqnyx_persistence.py" in line for line in report.problems
+    )
 
 
 def test_our_file_must_be_readable_by_the_user_the_server_runs_as(images):
@@ -163,7 +204,9 @@ def test_our_file_must_be_readable_by_the_user_the_server_runs_as(images):
     report = images.report()
 
     assert not report.ok
-    assert any("не читается" in line and "piqnyx_persistence.py" in line for line in report.problems)
+    assert any(
+        "не читается" in line and "piqnyx_persistence.py" in line for line in report.problems
+    )
 
 
 def test_a_mode_or_an_owner_that_changed_elsewhere_stops_the_work(images):
@@ -201,3 +244,139 @@ def test_an_empty_listing_is_a_failure_not_a_pass(images):
 
     assert not report.ok
     assert any("пуст" in line for line in report.problems)
+
+
+def test_the_way_the_image_starts_must_not_change(images):
+    images.new_config["Entrypoint"] = ["sh"]
+    images.new_config["User"] = "0"
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("Entrypoint" in line for line in report.problems)
+    assert any("User" in line for line in report.problems)
+
+
+def test_a_setting_that_went_missing_from_the_image_stops_the_work(images):
+    del images.new_config["Healthcheck"]
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("Healthcheck" in line for line in report.problems)
+
+
+def test_settings_that_cannot_be_read_are_a_failure_not_a_pass(images):
+    images.new_config = "not json"
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("настройки" in line for line in report.problems)
+
+
+def test_the_file_we_replace_must_be_the_one_of_the_tag(images):
+    path = f"{SITE}/openviking/session/session.py"
+    images.old[path] = ("session, not of the tag", "644", "0:0")
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("тег" in line and "session.py" in line for line in report.problems)
+
+
+def test_the_running_image_must_be_the_tag_in_every_other_file_too(images):
+    path = f"{SITE}/openviking/utils/model_retry.py"
+    images.old[path] = ("retry, not of the tag", "644", "0:0")
+    images.new[path] = images.old[path]
+
+    report = images.report()
+
+    assert not report.ok
+    assert report.unexpected == []
+    assert any("тег" in line and "model_retry.py" in line for line in report.problems)
+
+
+def test_a_file_we_call_new_must_not_be_in_the_running_image(images):
+    path = f"{SITE}/openviking/utils/piqnyx_persistence.py"
+    images.old[path] = ("somebody's", "644", "0:0")
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("новым" in line and "piqnyx_persistence.py" in line for line in report.problems)
+
+
+def test_a_tag_of_which_nothing_is_found_in_the_image_is_a_failure(images):
+    for name in list(images.tag_files):
+        (images.tag / name).unlink()
+    (images.tag / "openviking" / "elsewhere.py").write_text("x")
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("ни один" in line for line in report.problems)
+
+
+def test_files_of_the_tag_the_image_never_had_are_counted_not_blamed(images):
+    report = images.report()
+
+    assert report.ok, report.text
+    assert "совпало 2 из 2" in report.text
+    assert "в образ не ставились: 1" in report.text
+
+
+def test_a_label_of_the_running_image_must_stay_as_it_was(images):
+    images.new_config["Labels"] = {"org.piqnyx.version": "1"}
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("org.opencontainers.image.source" in line for line in report.problems)
+
+
+def test_a_label_that_is_added_must_be_ours(images):
+    images.new_config["Labels"]["com.example.surprise"] = "1"
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("com.example.surprise" in line for line in report.problems)
+
+
+def test_images_without_any_labels_are_in_order(images):
+    images.old_config["Labels"] = None
+    images.new_config["Labels"] = None
+
+    assert images.report().ok
+
+
+def test_a_file_we_replace_must_be_there_to_replace(images):
+    del images.old[f"{SITE}/openviking/session/session.py"]
+
+    report = images.report()
+
+    assert not report.ok
+    assert any("нет в исходном образе" in line and "session.py" in line for line in report.problems)
+
+
+def test_a_file_we_replace_keeps_the_mode_and_the_owner_it_had(images):
+    path = f"{SITE}/openviking/session/session.py"
+    text, _, _ = images.new[path]
+    images.new[path] = (text, "664", "1001:1001")
+
+    report = images.report()
+
+    assert not report.ok
+    assert report.unexpected == [("права или владелец", path)]
+
+
+def test_the_bytecode_we_replace_keeps_the_mode_and_the_owner_it_had(images):
+    path = f"{SITE}/openviking/session/__pycache__/session.{TAG}.pyc"
+    text, _, _ = images.new[path]
+    images.new[path] = (text, "600", "0:0")
+
+    report = images.report()
+
+    assert not report.ok
+    assert report.unexpected == [("права или владелец", path)]

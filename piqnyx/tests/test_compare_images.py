@@ -274,7 +274,7 @@ def test_settings_that_cannot_be_read_are_a_failure_not_a_pass(images):
     report = images.report()
 
     assert not report.ok
-    assert any("настройки" in line for line in report.problems)
+    assert any("параметры запуска" in line for line in report.problems)
 
 
 def test_the_file_we_replace_must_be_the_one_of_the_tag(images):

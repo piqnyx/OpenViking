@@ -13,13 +13,15 @@ Every other test must be there in both runs and give the same in both. It
 need not pass: the tests of upstream that fail in the image as it runs now
 fail for reasons of their own. What matters is that our change moved nothing.
 A difference is not judged here, it is shown, and it stops the work until
-somebody has looked at it.
+somebody has looked at it. A test that gives the same for another reason is
+shown too and stops nothing: it is a thing to know, not a thing moved.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +29,18 @@ from typing import Dict, List, Optional, Tuple
 MARK = "@@piqnyx "
 ORDER = ("passed", "skipped", "xfailed", "xpassed", "failed", "error")
 SHOWN = 40
+# What differs from run to run by itself: the names of tasks, places in memory, folders made for a test.
+PASSING = (
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "<id>"),
+    (re.compile(r"0x[0-9a-fA-F]+"), "<place>"),
+    (re.compile(r"/tmp/[^\s'\"]+"), "<folder>"),
+)
+
+
+def _plain(reason: str) -> str:
+    for what, word in PASSING:
+        reason = what.sub(word, reason)
+    return reason
 
 
 @dataclass
@@ -136,6 +150,13 @@ def compare(old_text: str, new_text: str, ours: List[str]) -> Tuple[bool, List[s
         for test in moved[:SHOWN]:
             reason = after[test][1] or before[test][1]
             lines.append(f"  было {before[test][0]}, стало {after[test][0]}: {test} -- {reason}")
+    other = [test for test in same if _plain(before[test][1]) != _plain(after[test][1])]
+    if other:
+        lines.append(f"к сведению, исход тот же, причина другая: {len(other)}")
+        for test in other[:SHOWN]:
+            lines.append(f"  {test}")
+            lines.append(f"    было: {before[test][1]}")
+            lines.append(f"    стало: {after[test][1]}")
     if problems:
         lines.append(f"НЕ ТАК: {len(problems)}")
         lines.extend(f"  {line}" for line in problems[:SHOWN])

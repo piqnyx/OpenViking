@@ -368,8 +368,15 @@ def test_an_image_that_is_what_it_claims_passes_the_check(fork):
     assert "ИТОГ: образ -- прежний плюс наши файлы, больше ничего" in done.stdout
     assert "ИТОГ: сервер в образе берёт наши файлы" in done.stdout
     assert "исходный образ сверен с тегом: совпало 2 из 2" in done.stdout
+    assert "параметров запуска образа сверено: 7" in done.stdout
     last = done.stdout.strip().splitlines()[-1]
     assert "ИТОГ ПРОВЕРКИ" in last and OUR_IMAGE in last and "ОСТАНОВКА" not in last
+    names = fork.root / "piqnyx" / ".work" / "check" / "not-in-base.txt"
+    assert names.read_text().splitlines() == [
+        "openviking/docs/only-in-the-source.md",
+        "openviking_cli/__init__.py",
+    ]
+    assert "piqnyx/.work/check/not-in-base.txt" in done.stdout
 
 
 def test_the_check_asks_docker_for_what_we_mean(fork):

@@ -99,13 +99,16 @@ class Run:
     def put(self, name, text):
         (self.root / name).write_text(text)
 
-    def run(self, *args, tools=None, each=None, timeout=120):
+    def run(self, *args, tools=None, each=None, side=None, timeout=120):
         command = [sys.executable, "-B", str(RUNNER)]
         if tools is not None:
             command += ["--tools", str(tools)]
         if each is not None:
             command += ["--each", str(each)]
-        command += ["--", *args]
+        if side is not None:
+            command += ["--side", side, "--common", "common.txt", "--ours", "ours.txt"]
+        if args:
+            command += ["--", *args]
         self.done = subprocess.run(
             command,
             cwd=self.root,
@@ -301,3 +304,73 @@ def test_a_home_that_is_asked_for_is_made(run, tmp_path, monkeypatch):
     )
 
     assert outcome(run.run("test_home.py"), "test_home") == "passed"
+
+
+@pytest.fixture
+def two_sides(run):
+    """Tests of upstream in a folder and beside it, tests of ours among them and apart."""
+    passing = "def test_one():\n    pass\n"
+    (run.root / "upstream").mkdir()
+    (run.root / "apart").mkdir()
+    run.put("upstream/test_theirs.py", passing)
+    run.put("upstream/test_ours_among_theirs.py", passing)
+    run.put("test_theirs_alone.py", passing)
+    run.put("apart/test_ours_apart.py", passing)
+    run.put("test_not_asked_for.py", passing)
+    run.put("common.txt", "upstream\n\ntest_theirs_alone.py\n")
+    run.put("ours.txt", "upstream/test_ours_among_theirs.py\napart/test_ours_apart.py\n")
+    return run
+
+
+def test_in_the_old_image_ours_are_left_out(two_sides):
+    read = two_sides.run(side="old")
+
+    assert sorted(read.tests) == [
+        "test_theirs_alone.py::test_one",
+        "upstream/test_theirs.py::test_one",
+    ]
+    assert read.end["status"] == 0
+
+
+def test_in_the_new_image_ours_are_run_and_each_test_once(two_sides):
+    read = two_sides.run(side="new")
+
+    assert sorted(read.tests) == [
+        "apart/test_ours_apart.py::test_one",
+        "test_theirs_alone.py::test_one",
+        "upstream/test_ours_among_theirs.py::test_one",
+        "upstream/test_theirs.py::test_one",
+    ]
+    begun = [line for line in two_sides.done.stderr.splitlines() if '"started"' in line]
+    assert len(begun) == 4
+    assert read.end["status"] == 0
+
+
+def test_a_name_of_the_list_that_is_not_there_fails_the_run(two_sides):
+    two_sides.put("common.txt", "upstream\nno_such_tests.py\n")
+
+    read = two_sides.run(side="old")
+
+    assert read.end["status"] not in (0, 1)
+    assert "no_such_tests.py" in two_sides.done.stderr + two_sides.done.stdout
+
+
+def test_an_empty_list_fails_the_run(two_sides):
+    two_sides.put("common.txt", "\n")
+
+    read = two_sides.run(side="new")
+
+    assert read.tests == {}
+    assert read.end["status"] not in (0, 1)
+    assert "пуст" in read.end.get("why", "")
+
+
+def test_a_side_without_its_lists_is_refused(run):
+    command = [sys.executable, "-B", str(RUNNER), "--side", "old"]
+
+    done = subprocess.run(
+        command, cwd=run.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+    assert done.returncode not in (0, 1)
+    assert compare_runs.read(done.stderr).end["status"] not in (0, 1)

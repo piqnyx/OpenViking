@@ -14,13 +14,15 @@ stops the work.
         --old-entries A.ent --new-entries B.ent \\
         --overlay piqnyx/overlay.txt --version VERSION.txt \\
         --site /app/.venv/lib/python3.13/site-packages --cache-tag cpython-313 \\
-        --source-root . --tag-root TAG --old-config A.json --new-config B.json
+        --source-root . --tag-root TAG --old-config A.json --new-config B.json \\
+        --absent-to NAMES.txt
 
 `TAG` holds the two packages as the tag has them (`git archive`): laying files
 over an image is sound only while that image is the tag we made our change to.
 `VERSION.txt` holds the version of the build and a line end, as the build
 writes it. `*.json` is the `Config` of an image as `docker image inspect`
-gives it.
+gives it. `NAMES.txt` is written: the files of the tag that the running image
+never had, which the report only counts by their kind.
 
 `*.sha` is what `sha256sum` prints; `*.ent` is type, mode, owner, path and link
 target, tab-separated, one entry a line (`find -printf '%y\\t%m\\t%U:%G\\t%p\\t%l\\n'`).
@@ -50,6 +52,7 @@ class Report:
     text: str
     unexpected: List[Tuple[str, str]] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
+    absent: List[str] = field(default_factory=list)
 
 
 def _files(text: str) -> Dict[str, str]:
@@ -93,10 +96,20 @@ def _count(number: int, one: str, few: str, many: str) -> str:
     return f"{number} {word}"
 
 
+def _by_kind(names: List[str]) -> str:
+    """`.scm 23, .md 9`: the most of a kind first."""
+    kinds: Dict[str, int] = {}
+    for name in names:
+        kind = os.path.splitext(name)[1] or "без расширения"
+        kinds[kind] = kinds.get(kind, 0) + 1
+    ordered = sorted(kinds.items(), key=lambda kind: (-kind[1], kind[0]))
+    return ", ".join(f"{kind} {count}" for kind, count in ordered)
+
+
 def _against_the_tag(
     tag_root: str, site: str, old: Dict[str, str], overlay: List[str], problems: List[str]
-) -> Tuple[int, int, int]:
-    """The running image against the tag: how many files match, were looked at, were never put in."""
+) -> Tuple[int, int, List[str]]:
+    """The running image against the tag: how many files match, were looked at, which were never put in."""
     of_the_tag: Dict[str, str] = {}
     for folder, _, names in os.walk(tag_root):
         for name in names:
@@ -109,11 +122,12 @@ def _against_the_tag(
                 continue
             of_the_tag[os.path.relpath(path, tag_root).replace(os.sep, "/")] = digest
 
-    matched = looked_at = absent = 0
+    matched = looked_at = 0
+    absent: List[str] = []
     for name, digest in sorted(of_the_tag.items()):
         path = f"{site}/{name}"
         if path not in old:
-            absent += 1
+            absent.append(name)
             if name in overlay:
                 problems.append(f"файла, который мы меняем, нет в исходном образе: {path}")
             continue
@@ -255,7 +269,7 @@ def compare(
     if tag_root is not None:
         of_the_tag = _against_the_tag(tag_root, site, old, overlay, problems)
 
-    settings = 0
+    settings: List[str] = []
     labels = None
     if old_config is not None or new_config is not None:
         try:
@@ -263,28 +277,30 @@ def compare(
             if not isinstance(before, dict) or not isinstance(after, dict):
                 raise ValueError("не словарь")
         except ValueError as trouble:
-            problems.append(f"настройки образа не прочитать: {trouble}")
+            problems.append(f"параметры запуска образа не прочитать: {trouble}")
         else:
             # The id names the image itself; the labels have a rule of their own.
             for key in sorted((set(before) | set(after)) - {"Labels", "Image"}):
-                settings += 1
+                settings.append(key)
                 if before.get(key) != after.get(key):
                     problems.append(
-                        f"настройка образа изменилась: {key}: было {before.get(key)!r}, "
+                        f"параметр запуска образа изменился: {key}: было {before.get(key)!r}, "
                         f"стало {after.get(key)!r}"
                     )
             labels = _labels(before.get("Labels"), after.get("Labels"), problems)
 
     lines = [
         f"файлов в старом образе {len(old)}, в новом {len(new)}",
-        f"настроек запуска сверено: {settings}",
+        f"параметров запуска образа сверено: {len(settings)}"
+        + (f" ({', '.join(settings)})" if settings else ""),
     ]
     if labels is not None:
         lines.append(f"меток исходного образа {labels[0]}, наших добавлено {labels[1]}")
     if of_the_tag is not None:
+        never = of_the_tag[2]
         lines.append(
             f"исходный образ сверен с тегом: совпало {of_the_tag[0]} из {of_the_tag[1]}, "
-            f"в образ не ставились: {of_the_tag[2]}"
+            f"в образ не ставились: {len(never)}" + (f" ({_by_kind(never)})" if never else "")
         )
     lines += [
         f"наложено: {_count(len(ours), 'наш файл', 'наших файла', 'наших файлов')}",
@@ -309,6 +325,7 @@ def compare(
         text="\n".join(lines),
         unexpected=[(reason, path) for path, reason in sorted(unexpected.items())],
         problems=problems,
+        absent=list(of_the_tag[2]) if of_the_tag is not None else [],
     )
 
 
@@ -327,6 +344,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--old-config")
     parser.add_argument("--new-config")
     parser.add_argument("--tag-root")
+    parser.add_argument("--absent-to")
     args = parser.parse_args(argv)
     overlay_text = _read(args.overlay)
     report = compare(
@@ -345,6 +363,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         tag_root=args.tag_root,
     )
     print(report.text)
+    if args.absent_to:
+        with open(args.absent_to, "w", encoding="utf-8") as out:
+            out.write("".join(f"{name}\n" for name in report.absent))
     return 0 if report.ok else 1
 
 

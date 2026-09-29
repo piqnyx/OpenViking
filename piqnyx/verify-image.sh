@@ -67,7 +67,9 @@ python3 "$HERE/compare_images.py" \
     --old-config "$check/old.json" --new-config "$check/new.json" \
     --overlay "$HERE/overlay.txt" --version "$check/version.txt" \
     --site "$SITE" --cache-tag "$cache_tag" \
-    --source-root "$ROOT" --tag-root "$check/tag" || failed=1
+    --source-root "$ROOT" --tag-root "$check/tag" \
+    --absent-to "$check/not-in-base.txt" || failed=1
+echo "имена файлов тега, что в образ не ставились: ${check#"$ROOT"/}/not-in-base.txt"
 
 echo
 echo "== Проверка изнутри образа, от пользователя $RUN_AS"

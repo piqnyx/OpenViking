@@ -224,6 +224,29 @@ def test_a_name_that_leads_out_of_the_packages_stops_the_build(build, name):
     assert build.untouched()
 
 
+def test_a_link_where_our_file_is_to_lie_stops_the_build(build):
+    (build.site / "pkg/elsewhere.py").write_text("X = 'kept elsewhere'\n")
+    (build.site / "pkg/new.py").symlink_to("elsewhere.py")
+
+    done = build.run()
+
+    assert done.returncode != 0
+    assert "pkg/new.py" in done.stderr and "не файл" in done.stderr
+    assert (build.site / "pkg/elsewhere.py").read_text() == "X = 'kept elsewhere'\n"
+    assert build.untouched()
+
+
+def test_a_folder_where_our_file_is_to_lie_stops_the_build(build):
+    (build.site / "pkg/new.py").mkdir()
+
+    done = build.run()
+
+    assert done.returncode != 0
+    assert "pkg/new.py" in done.stderr and "не файл" in done.stderr
+    assert list((build.site / "pkg/new.py").iterdir()) == []
+    assert build.untouched()
+
+
 def test_a_build_without_a_version_stops(build):
     done = build.run(version="")
 

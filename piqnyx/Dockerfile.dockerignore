@@ -1,0 +1,7 @@
+# piqnyx: the build is lent the two packages, our list and the step, nothing more.
+*
+!openviking
+!openviking_cli
+!piqnyx/overlay.txt
+!piqnyx/lay_over.sh
+**/__pycache__

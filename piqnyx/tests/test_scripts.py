@@ -5,7 +5,7 @@
 What is checked here is how the scripts reason and what they ask docker for.
 How a real docker answers is seen on the server only.
 
-Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider --no-cov
+Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider -o addopts=""
 """
 
 import hashlib
@@ -269,6 +269,16 @@ def test_a_version_that_is_in_work_is_not_built_again(fork):
     assert done.returncode != 0
     assert "в работе" in done.stderr and "openviking" in done.stderr
     assert fork.calls("build") == []
+
+
+def test_the_first_build_asks_nothing_of_an_image_that_is_not_there_yet(fork):
+    del fork.scenario["images"][OUR_IMAGE]
+
+    done = fork.run("build.sh")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert fork.calls("ps") == []
+    assert len(fork.calls("build")) == 1
 
 
 def test_a_build_that_failed_is_not_called_built(fork):

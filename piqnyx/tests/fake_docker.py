@@ -51,6 +51,11 @@ def main(argv):
     if argv[:1] == ["ps"]:
         asked = [item for item in argv if item.startswith("ancestor=")]
         name = asked[0].split("=", 1)[1] if asked else ""
+        if name not in images:
+            # What a real docker says of an image it does not have is not known here.
+            return done(
+                1, err=f"fake docker: asked for the containers of an unknown image {name}\n"
+            )
         return done(0, "".join(f"{one}\n" for one in scenario.get("containers", {}).get(name, [])))
 
     if argv[:1] == ["build"]:

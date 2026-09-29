@@ -47,6 +47,7 @@ from openviking.session.tool_result_synopsis import (
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.model_retry import is_retryable_api_error, retry_async
+from openviking.utils.piqnyx_persistence import queue_survives_a_stop, until_cured
 from openviking.utils.time_utils import get_current_timestamp
 from openviking.utils.token_estimation import estimate_text_tokens, truncate_text_to_token_budget
 from openviking_cli.exceptions import (
@@ -67,6 +68,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _ARCHIVE_WAIT_POLL_SECONDS = 0.1
+# piqnyx (PIQNYX.md, stage 1): an archive may now wait out a storm for hours, and the one
+# after it waits for it. Ten looks a second, each reading every marker of the session, is
+# too much for that long: the pause doubles up to this.
+_ARCHIVE_WAIT_POLL_MAX_SECONDS = 5.0
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 _MEMORY_EXTRACTION_MAX_RETRIES = 3
 _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -2331,15 +2336,54 @@ class Session:
                         # transient-error classifier so permanent failures (auth,
                         # quota, content-safety, 400, oversized input) fail fast
                         # instead of being retried pointlessly.
-                        return await retry_async(
-                            fn,
-                            max_retries=_MEMORY_EXTRACTION_MAX_RETRIES,
-                            base_delay=_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
-                            max_delay=_MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
-                            is_retryable=is_retryable_api_error,
-                            logger=logger,
-                            operation_name=operation_name,
+                        async def _quick_repeats() -> Any:
+                            return await retry_async(
+                                fn,
+                                max_retries=_MEMORY_EXTRACTION_MAX_RETRIES,
+                                base_delay=_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
+                                max_delay=_MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
+                                is_retryable=is_retryable_api_error,
+                                logger=logger,
+                                operation_name=operation_name,
+                            )
+
+                        # piqnyx (PIQNYX.md, stage 1): the quick repeats above are over
+                        # within minutes, a storm at the model's door lasts hours. What
+                        # waiting can cure is repeated until it passes, the wait doubling
+                        # from two seconds to fifteen minutes. The archive stays pending
+                        # meanwhile, and a pending archive keeps the session's context
+                        # whole; a failed one takes the summary out of it.
+                        waited = False
+
+                        async def _tell_of_the_wait(
+                            failed_attempts: int, kind: str, wait: float, _error: BaseException
+                        ) -> None:
+                            nonlocal waited
+                            waited = True
+                            await tracker.update_stage(
+                                task_id,
+                                f"repeating {operation_name}: attempt {failed_attempts} failed "
+                                f"({kind}), next in {wait:.0f} s",
+                                account_id=self.ctx.account_id,
+                                user_id=self.ctx.user.user_id,
+                            )
+
+                        result = await until_cured(
+                            _quick_repeats,
+                            operation=f"session {self.session_id} {operation_name}",
+                            on_wait=_tell_of_the_wait,
                         )
+                        if waited:
+                            try:
+                                await tracker.update_stage(
+                                    task_id,
+                                    f"{operation_name} passed after repeats",
+                                    account_id=self.ctx.account_id,
+                                    user_id=self.ctx.user.user_id,
+                                )
+                            except Exception as trouble:
+                                logger.warning("Could not update the task's stage: %s", trouble)
+                        return result
 
                     async def _run_recorded_memory_step(
                         operation_name: str,
@@ -2672,11 +2716,27 @@ class Session:
             )
             logger.info(f"Session {self.session_id} memory extraction completed")
         except asyncio.CancelledError:
-            await self._write_failed_marker(
-                archive_uri,
-                stage="cancelled",
-                error="session commit cancelled",
-            )
+            # piqnyx (PIQNYX.md, stage 1): a cancel that was asked for marks the archive,
+            # as upstream does. A stop of the server is not one: the queue keeps the job
+            # and hands it out again at the next start, and a failed marker would make
+            # that start give the archive up. With steps that wait out a storm a stop in
+            # the middle of a wait is the likely case, not the rare one. A queue that
+            # would forget the job is another matter, and there the marker is written.
+            if tracker.is_cancellation_requested(task_id) or not queue_survives_a_stop(
+                get_openviking_config
+            ):
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="cancelled",
+                    error="session commit cancelled",
+                )
+            else:
+                logger.warning(
+                    "Session %s Phase 2 of %s stopped with no cancel asked for; the archive "
+                    "stays pending and the queue repeats the job at the next start",
+                    self.session_id,
+                    archive_uri,
+                )
             raise
         except Exception as e:
             await self._write_failed_marker(
@@ -3744,6 +3804,7 @@ class Session:
         if archive_index <= 1 or not self._viking_fs:
             return True
 
+        pause = _ARCHIVE_WAIT_POLL_SECONDS
         while True:
             earlier_states = [
                 state for state in await self._scan_archive_states() if state.index < archive_index
@@ -3771,7 +3832,8 @@ class Session:
                 reconciled = True
             if reconciled:
                 continue
-            await asyncio.sleep(_ARCHIVE_WAIT_POLL_SECONDS)
+            await asyncio.sleep(pause)
+            pause = min(pause * 2, _ARCHIVE_WAIT_POLL_MAX_SECONDS)
 
     async def _prepare_phase2_archive_messages(
         self,

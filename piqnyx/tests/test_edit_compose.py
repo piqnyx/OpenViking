@@ -279,3 +279,24 @@ def test_the_program_does_not_trust_its_own_edit(tmp_path, capsys, monkeypatch):
     assert code == 1
     assert not new.exists()
     assert "user" in capsys.readouterr().out
+
+
+def test_the_image_the_file_names_now_is_told(tmp_path, capsys):
+    source = tmp_path / "docker-compose.yml"
+    source.write_text(
+        COMPOSE.replace(
+            "image: ghcr.io/volcengine/openviking:latest",
+            'image: "ghcr.io/volcengine/openviking:latest"  # as it runs',
+        )
+    )
+    given = ["--file", str(source), "--service", "openviking", "--image-now"]
+
+    assert edit_compose.main(given) == 0
+    assert capsys.readouterr().out.splitlines() == ["ghcr.io/volcengine/openviking:latest"]
+
+    source.write_text(edit().text)
+    assert edit_compose.main(given) == 0
+    assert capsys.readouterr().out.splitlines() == [OURS]
+
+    source.write_text(COMPOSE.replace("  openviking:", "  viking:"))
+    assert edit_compose.main(given) == 1

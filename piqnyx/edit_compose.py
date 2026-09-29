@@ -7,6 +7,7 @@
         --image piqnyx/openviking:0.4.12-piqnyx.1 --was-of ghcr.io/volcengine/openviking \\
         --out NEW.yml
     edit_compose.py --file docker-compose.yml --service openviking --data-folder
+    edit_compose.py --file docker-compose.yml --service openviking --image-now
 
 The line of the image is changed and `pull_policy: never` is put after it, so
 that the image is taken from the disk only. The file is read line by line and
@@ -14,7 +15,8 @@ written back as it was, line ends and all: no line is touched but these two.
 The given file is not written to; the new one goes to `--out`.
 
 Ends with 0 when the file was changed, 3 when it is ours already, 1 when the
-edit is refused. `--data-folder` prints what the service keeps its data in.
+edit is refused. `--data-folder` prints what the service keeps its data in,
+`--image-now` the image the file names as it is.
 """
 
 from __future__ import annotations
@@ -114,8 +116,8 @@ def _keys(lines: List[str], begin: int, end: int) -> List[Tuple[int, str, str]]:
     return found
 
 
-def edit(text: str, *, service: str, image: str, was_of: str) -> Done:
-    lines = text.splitlines(keepends=True)
+def _image(lines: List[str], service: str) -> Tuple[int, str, List[Tuple[int, str, str]]]:
+    """The line of the image of the service, what stands after its key, the keys of the service."""
     begin, end = _service(lines, service)
     keys = _keys(lines, begin, end)
     images = [(n, rest) for n, key, rest in keys if key == "image"]
@@ -123,7 +125,17 @@ def edit(text: str, *, service: str, image: str, was_of: str) -> Done:
         raise Refused(f"у сервиса {service} нет строки image")
     if len(images) > 1:
         raise Refused(f"у сервиса {service} строка image дана дважды")
-    at, rest = images[0]
+    return images[0][0], images[0][1], keys
+
+
+def image_now(text: str, *, service: str) -> str:
+    """The image the file names for the service as it is."""
+    return _value(_image(text.splitlines(keepends=True), service)[1])[0]
+
+
+def edit(text: str, *, service: str, image: str, was_of: str) -> Done:
+    lines = text.splitlines(keepends=True)
+    at, rest, keys = _image(lines, service)
     was, tail = _value(rest)
     if was != image and was != was_of and not was.startswith((was_of + ":", was_of + "@")):
         raise Refused(f"образ в файле не тот, что ждали: {was} (ждали {was_of} или {image})")
@@ -207,6 +219,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--was-of")
     parser.add_argument("--out")
     parser.add_argument("--data-folder", action="store_true")
+    parser.add_argument("--image-now", action="store_true")
     args = parser.parse_args(argv)
     with open(args.file, encoding="utf-8", newline="") as source:
         text = source.read()
@@ -218,6 +231,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"ОСТАНОВКА: у сервиса {args.service} не найден каталог данных")
                 return 1
             print(folder)
+            return 0
+        if args.image_now:
+            print(image_now(text, service=args.service))
             return 0
         if not (args.image and args.was_of and args.out):
             parser.error("--image, --was-of and --out are needed")

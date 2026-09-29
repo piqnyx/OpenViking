@@ -36,6 +36,9 @@ while IFS= read -r name || [ -n "$name" ]; do
         *//* | */../* | */./*) stop "имя ведёт вон из пакетов: $name" ;;
     esac
     [ -f "$src/$name" ] || stop "в исходниках нет файла из списка: $name"
+    if [ -L "$site/$name" ] || { [ -e "$site/$name" ] && [ ! -f "$site/$name" ]; }; then
+        stop "в образе на месте нашего файла лежит не файл: $name"
+    fi
     case "$name" in
         *.py)
             python -B -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' \
@@ -54,7 +57,7 @@ mode_of() {
 while IFS= read -r name || [ -n "$name" ]; do
     [ -n "$name" ] || continue
     mode=$(mode_of "$site/$name")
-    install -D -m "$mode" "$src/$name" "$site/$name"
+    install -D -T -m "$mode" "$src/$name" "$site/$name"
     case "$name" in
         *.py)
             compiled=$(python -B -c \

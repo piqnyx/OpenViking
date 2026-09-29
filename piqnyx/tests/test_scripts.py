@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from test_compare_images import OURS, SITE, TAG, Images, entries_of, files_of
 from test_compare_runs import records
+from test_edit_compose import COMPOSE
 
 HERE = Path(__file__).resolve().parent
 RECIPE = HERE.parent
@@ -31,12 +32,15 @@ CARRIED = (
     "build.sh",
     "verify-image.sh",
     "test-in-image.sh",
+    "replace-container.sh",
     "lay_over.sh",
     "check_list.py",
     "compare_images.py",
     "inside_check.py",
     "run_tests_inside.py",
     "compare_runs.py",
+    "edit_compose.py",
+    "pending_archives.py",
     "test-ov.conf",
 )
 FACTS = {
@@ -52,8 +56,15 @@ FACTS = {
     "TEST_LONGEST": "7",
     "TEST_CPUS": "2",
     "TEST_MEMORY": "3g",
+    "COMPOSE": "../docker-compose.yml",
+    "SERVICE": "openviking",
+    "CONTAINER": "openviking",
+    "HEALTHY_WITHIN": "4",
 }
 OUR_IMAGE = f"{FACTS['NAME']}:{FACTS['VERSION']}"
+# What the compose file of the server names: the tag that moves, of the image we built on.
+THEIR_IMAGE = FACTS["BASE"].split("@")[0] + ":latest"
+SESSION = "workspace/viking/openclaw-main/user/agent-main/sessions/9478e347"
 
 
 class Fork:
@@ -62,8 +73,17 @@ class Fork:
     def __init__(self, tmp_path):
         self.images = Images(tmp_path)
         self.images.new["/app/PIQNYX-VERSION"] = (FACTS["VERSION"] + "\n", "644", "0:0")
-        self.root = tmp_path / "fork"
-        self.root.mkdir()
+        # As on the server: the compose file, the clone beside it, the data a folder up.
+        self.home = tmp_path / "memory" / "openviking"
+        self.root = self.home / "source"
+        self.root.mkdir(parents=True)
+        self.compose = self.home / "docker-compose.yml"
+        self.compose.write_text(COMPOSE.replace("ghcr.io/volcengine/openviking", THEIR_IMAGE[:-7]))
+        self.data = tmp_path / "memory" / "data" / "openviking"
+        for number, mark in ((1, ".done"), (2, ".failed.json")):
+            archive = self.data / SESSION / "history" / f"archive_{number:03d}"
+            archive.mkdir(parents=True)
+            (archive / mark).write_text("{}")
         self.git("init", "-q", "-b", "upstream")
         for name, text in self.images.tag_files.items():
             self.put(name, text)
@@ -96,14 +116,34 @@ class Fork:
         self.bin.mkdir()
         (self.bin / "docker").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
         (self.bin / "docker").chmod(0o755)
+        theirs = {"side": "old", "config": self.images.old_config, "id": "sha256:o"}
         self.scenario = {
             "images": {
-                FACTS["BASE"]: {"side": "old", "config": self.images.old_config, "id": "sha256:o"},
-                OUR_IMAGE: {"side": "new", "config": self.images.new_config, "id": "sha256:n"},
+                FACTS["BASE"]: theirs,
+                THEIR_IMAGE: theirs,
+                OUR_IMAGE: {
+                    "side": "new",
+                    "config": self.images.new_config,
+                    "id": "sha256:n",
+                    "version_inside": FACTS["VERSION"],
+                },
             },
             "cache_tag": TAG,
             "site": SITE,
         }
+        self.runs({"image": THEIR_IMAGE, "id": "sha256:o", "looked": 1})
+
+    def runs(self, container):
+        """The container that is there when the script begins; none, when `None`."""
+        kept = self.docker / "container.json"
+        if container is None:
+            kept.unlink(missing_ok=True)
+        else:
+            kept.write_text(json.dumps(container))
+
+    def running(self):
+        kept = self.docker / "container.json"
+        return json.loads(kept.read_text()) if kept.exists() else None
 
     def path(self, *parts):
         path = self.root.joinpath(*parts)
@@ -136,7 +176,7 @@ class Fork:
         self.git("add", "-A")
         self.git("commit", "-q", "-m", message)
 
-    def run(self, script, cwd=None, **more):
+    def run(self, script, *keys, cwd=None, **more):
         (self.docker / "scenario.json").write_text(json.dumps(self.scenario))
         for side, image in (("old", self.images.old), ("new", self.images.new)):
             (self.docker / f"{side}.sha").write_text(files_of(image))
@@ -148,9 +188,10 @@ class Fork:
             os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_DOCKER=str(self.docker)
         )
         env.pop("PIQNYX_TELL_EVERY", None)
+        env.pop("PIQNYX_LOOK_EVERY", None)
         env.update(more)
         return subprocess.run(
-            ["bash", str(self.root / "piqnyx" / script)],
+            ["bash", str(self.root / "piqnyx" / script), *keys],
             cwd=cwd or self.root,
             env=env,
             stdout=subprocess.PIPE,

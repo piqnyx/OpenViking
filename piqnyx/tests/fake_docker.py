@@ -7,12 +7,15 @@ It checks how the scripts reason, not how docker behaves: what a real docker
 says to these calls is seen on the server only.
 
 `FAKE_DOCKER` names a folder with `scenario.json` and the listings the images
-are to give; every call is added to `calls.jsonl` there.
+are to give; every call is added to `calls.jsonl` there. The one container it
+knows of is kept in `container.json`: `compose up` makes it of the image the
+compose file names, `compose down` takes it away.
 """
 
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -31,6 +34,78 @@ def main(argv):
         sys.stdout.write(out)
         sys.stderr.write(err)
         return code
+
+    kept = os.path.join(home, "container.json")
+
+    def container():
+        if not os.path.exists(kept):
+            return None
+        with open(kept, encoding="utf-8") as source:
+            return json.load(source)
+
+    def keep(what):
+        with open(kept, "w", encoding="utf-8") as out:
+            json.dump(what, out)
+
+    if argv[:1] == ["compose"]:
+        rest = argv[1:]
+        file = None
+        while rest and rest[0].startswith("-"):
+            if rest[0] in ("-f", "--file"):
+                file = rest[1]
+            rest = rest[2:]
+        call["compose"] = rest
+        if file is not None and os.path.exists(file):
+            with open(file, encoding="utf-8") as source:
+                named = re.search(r"^\s+image:\s*(\S+)", source.read(), re.M)
+            call["names"] = named.group(1) if named else None
+        if rest[:1] == ["version"]:
+            if scenario.get("compose", True):
+                return done(0, "Docker Compose version v0.0.0-fake\n")
+            return done(1, err="docker: 'compose' is not a docker command.\n")
+        if rest[:1] == ["config"]:
+            code = scenario.get("config_code", 0)
+            return done(code, err="" if code == 0 else "validating: the stand-in says no\n")
+        if rest[:1] == ["down"]:
+            if os.path.exists(kept):
+                os.remove(kept)
+            return done(scenario.get("down_code", 0))
+        if rest[:1] == ["up"]:
+            name = call.get("names")
+            if name not in images:
+                return done(1, err=f"pull access denied for {name}\n")
+            code = scenario.get("up_codes", {}).get(name, 0)
+            if code == 0:
+                keep({"image": name, "id": images[name].get("id", "sha256:fake"), "looked": 0})
+            return done(code, err="" if code == 0 else "the stand-in could not start it\n")
+        return done(64, err=f"fake docker: no answer for compose {rest}\n")
+
+    if argv[:1] == ["inspect"]:
+        now = container()
+        if now is None or argv[-1] != scenario.get("container", "openviking"):
+            return done(1, err=f"Error: No such object: {argv[-1]}\n")
+        states = scenario.get("states", {}).get(
+            now["image"], ["running starting", "running healthy"]
+        )
+        state = states[min(now["looked"], len(states) - 1)]
+        now["looked"] += 1
+        keep(now)
+        return done(0, f"{now['id']} {state}\n")
+
+    if argv[:1] == ["logs"]:
+        now = container()
+        if now is None:
+            return done(1, err=f"Error: No such container: {argv[-1]}\n")
+        return done(0, f"a line of the log of {now['image']}\n", "and one on the other way out\n")
+
+    if argv[:1] == ["exec"]:
+        now = container()
+        if now is None:
+            return done(1, err=f"Error: No such container: {argv[1]}\n")
+        inside = images.get(now["image"], {}).get("version_inside")
+        if inside is None:
+            return done(1, err="cat: /app/PIQNYX-VERSION: No such file or directory\n")
+        return done(0, inside + "\n")
 
     if argv[:2] == ["buildx", "version"]:
         if scenario.get("buildkit", True):

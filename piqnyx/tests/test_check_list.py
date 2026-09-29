@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """The check of the list before the build, on made-up differences.
 
-Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider --no-cov
+Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider -o addopts=""
 """
 
 import importlib.util

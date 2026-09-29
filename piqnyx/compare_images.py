@@ -12,13 +12,15 @@ stops the work.
 
     compare_images.py --old-files A.sha --new-files B.sha \\
         --old-entries A.ent --new-entries B.ent \\
-        --overlay piqnyx/overlay.txt --version piqnyx/VERSION \\
+        --overlay piqnyx/overlay.txt --version VERSION.txt \\
         --site /app/.venv/lib/python3.13/site-packages --cache-tag cpython-313 \\
         --source-root . --tag-root TAG --old-config A.json --new-config B.json
 
 `TAG` holds the two packages as the tag has them (`git archive`): laying files
 over an image is sound only while that image is the tag we made our change to.
-`*.json` is the `Config` of an image as `docker image inspect` gives it.
+`VERSION.txt` holds the version of the build and a line end, as the build
+writes it. `*.json` is the `Config` of an image as `docker image inspect`
+gives it.
 
 `*.sha` is what `sha256sum` prints; `*.ent` is type, mode, owner, path and link
 target, tab-separated, one entry a line (`find -printf '%y\\t%m\\t%U:%G\\t%p\\t%l\\n'`).

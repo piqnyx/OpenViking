@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """The check that runs inside the image, on made-up packages.
 
-Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider --no-cov
+Run from the root of the fork:  python3 -m pytest piqnyx/tests -q -p no:cacheprovider -o addopts=""
 """
 
 import importlib.util

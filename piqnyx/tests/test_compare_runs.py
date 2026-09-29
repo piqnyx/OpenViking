@@ -134,6 +134,16 @@ def test_a_run_that_was_cut_short_stops_the_work():
     assert told(lines, "новый образ", "оборван", name)
 
 
+def test_a_run_that_was_cut_short_at_its_first_test_says_so_too():
+    first = next(iter(COMMON))
+
+    ok, lines = compare(old=records(COMMON, cut_at=first))
+
+    assert not ok
+    assert told(lines, "старый образ", "оборван", first)
+    assert not told(lines, "старый образ", "ничего не записал")
+
+
 def test_a_run_that_pytest_could_not_carry_out_stops_the_work():
     for status in (2, 3, 4, 5):
         ok, lines = compare(old=records(COMMON, status=status))

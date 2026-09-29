@@ -136,7 +136,7 @@ class Fork:
         self.git("add", "-A")
         self.git("commit", "-q", "-m", message)
 
-    def run(self, script, cwd=None):
+    def run(self, script, cwd=None, **more):
         (self.docker / "scenario.json").write_text(json.dumps(self.scenario))
         for side, image in (("old", self.images.old), ("new", self.images.new)):
             (self.docker / f"{side}.sha").write_text(files_of(image))
@@ -147,6 +147,8 @@ class Fork:
         env = dict(
             os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_DOCKER=str(self.docker)
         )
+        env.pop("PIQNYX_TELL_EVERY", None)
+        env.update(more)
         return subprocess.run(
             ["bash", str(self.root / "piqnyx" / script)],
             cwd=cwd or self.root,
@@ -539,8 +541,37 @@ def test_tests_that_give_the_same_in_both_images_pass(fork):
     assert done.returncode == 0, done.stdout + done.stderr
     assert "общих тестов 2: исход одинаков у 2" in done.stdout
     assert "наших тестов в новом образе 1: прошли 1" in done.stdout
+    assert done.stdout.count("кончено: есть упавшие тесты") == 2
     last = done.stdout.strip().splitlines()[-1]
     assert "ИТОГ ТЕСТОВ" in last and "ОСТАНОВКА" not in last
+
+
+def test_how_a_run_ended_is_told_in_words(fork):
+    fork.scenario["tests_code"] = {"old": 0, "new": 137}
+
+    done = fork.run("test-in-image.sh")
+
+    assert "кончено: все тесты прошли" in done.stdout
+    assert "кончено с кодом 137" in done.stdout
+
+
+def test_a_long_run_tells_how_far_it_has_got(fork):
+    fork.scenario["tests_last"] = 2.5
+
+    done = fork.run("test-in-image.sh", PIQNYX_TELL_EVERY="1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    told = [line for line in done.stdout.splitlines() if "тестов записано" in line]
+    assert len(told) >= 2
+    assert any("тестов записано 1" in line for line in told)
+    assert "общих тестов 2: исход одинаков у 2" in done.stdout
+
+
+def test_a_short_run_tells_nothing_in_between(fork):
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "тестов записано" not in done.stdout
 
 
 def test_the_tools_are_the_only_thing_taken_from_the_network(fork):

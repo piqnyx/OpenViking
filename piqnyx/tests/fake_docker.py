@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 
 def main(argv):
@@ -96,6 +97,15 @@ def main(argv):
             if os.path.exists(records):
                 with open(records, encoding="utf-8") as source:
                     told = source.read()
+            # A run that takes its time writes its records down as it goes.
+            lasts = scenario.get("tests_last", 0)
+            if lasts:
+                half = len(told) // 2
+                cut = told.rfind("\n", 0, half) + 1
+                sys.stderr.write(told[:cut])
+                sys.stderr.flush()
+                time.sleep(lasts)
+                told = told[cut:]
             return done(scenario.get("tests_code", {}).get(side, 1), "fake talk of pytest\n", told)
         if command[:1] == ["-"]:
             given = sys.stdin.buffer.read()

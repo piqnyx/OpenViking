@@ -30,7 +30,7 @@ NEW_ONLY = {
 }
 
 
-def records(tests, status=1, seconds=12.5, cut_at=None, noise=True):
+def records(tests, status=1, seconds=12.5, cut_at=None, noise=True, reasons=None):
     """What a run leaves on its second way out, other talk mixed in."""
     lines = ["warning: something of no concern"] if noise else []
     for name, outcome in tests.items():
@@ -38,6 +38,7 @@ def records(tests, status=1, seconds=12.5, cut_at=None, noise=True):
         if name == cut_at:
             return "\n".join(lines) + "\n"
         why = "" if outcome in ("passed", "skipped") else "AssertionError: made up"
+        why = (reasons or {}).get(name, why)
         record = {"kind": "test", "id": name, "outcome": outcome, "why": why}
         lines.append("@@piqnyx " + json.dumps(record))
     end = {"kind": "end", "status": status, "seconds": seconds}
@@ -81,6 +82,40 @@ def test_a_test_that_failed_and_now_passes_is_a_difference_too():
 
     assert not ok
     assert told(lines, "было failed", "стало passed", name)
+
+
+def test_the_same_outcome_for_another_reason_is_shown_and_stops_nothing():
+    name = "tests/unit/session/test_session_commit_resume.py::test_resume[{}]"
+    old = records(COMMON, reasons={name: "TimeoutError: the task did not end in 30.0s"})
+    new = records({**COMMON, **NEW_ONLY}, reasons={name: "AssertionError: failed is not done"})
+
+    ok, lines = compare(old=old, new=new)
+
+    assert ok, lines
+    assert told(lines, "исход тот же, причина другая: 1")
+    assert told(lines, name)
+    assert told(lines, "было:", "TimeoutError: the task did not end in 30.0s")
+    assert told(lines, "стало:", "AssertionError: failed is not done")
+
+
+def test_what_differs_from_run_to_run_by_itself_is_not_another_reason():
+    name = "tests/unit/session/test_session_commit_resume.py::test_resume[{}]"
+    was = (
+        "TimeoutError: Task 8eefdb0d-0811-4610-b0cf-bbaa12196dd2 of <Session object at "
+        "0x7f3a1c2b9d30> in /tmp/pytest-of-x/pytest-12/test_a0/data did not complete"
+    )
+    now = (
+        "TimeoutError: Task 476d3e7c-bd10-4b26-8d6f-0bf37aa32d9d of <Session object at "
+        "0x7f11aa0c4e10> in /tmp/pytest-of-x/pytest-13/test_a0/data did not complete"
+    )
+
+    ok, lines = compare(
+        old=records(COMMON, reasons={name: was}),
+        new=records({**COMMON, **NEW_ONLY}, reasons={name: now}),
+    )
+
+    assert ok, lines
+    assert not told(lines, "причина другая")
 
 
 def test_a_test_that_one_run_lacks_stops_the_work():

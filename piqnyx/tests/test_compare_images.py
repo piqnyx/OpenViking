@@ -29,6 +29,16 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def files_of(image):
+    """What `sha256sum` would say of the files of a made-up image."""
+    return "".join(f"{digest(text)}  {path}\n" for path, (text, _, _) in image.items())
+
+
+def entries_of(image):
+    """What `find -printf` would say of them: kind, mode, owner, path, link."""
+    return "".join(f"f\t{mode}\t{owner}\t{path}\t\n" for path, (_, mode, owner) in image.items())
+
+
 class Images:
     """Two made-up images and the checkout our files come from."""
 
@@ -99,19 +109,11 @@ class Images:
         )
 
     def report(self, overlay=OURS):
-        def files(image):
-            return "".join(f"{digest(text)}  {path}\n" for path, (text, _, _) in image.items())
-
-        def entries(image):
-            return "".join(
-                f"f\t{mode}\t{owner}\t{path}\t\n" for path, (_, mode, owner) in image.items()
-            )
-
         return compare_images.compare(
-            old_files=files(self.old),
-            new_files=files(self.new),
-            old_entries=entries(self.old),
-            new_entries=entries(self.new),
+            old_files=files_of(self.old),
+            new_files=files_of(self.new),
+            old_entries=entries_of(self.old),
+            new_entries=entries_of(self.new),
             overlay=list(overlay),
             site=SITE,
             cache_tag=TAG,

@@ -127,6 +127,19 @@ def test_what_is_said_in_the_archives_is_not_read_and_not_shown(data):
     assert not any("secret" in line for line in found.lines)
 
 
+def test_the_archives_themselves_are_not_gone_into(data):
+    if os.geteuid() == 0:
+        pytest.skip("root reads everything")
+    inside = data.root / MAIN / "history" / "archive_001" / "kept-to-itself"
+    inside.mkdir()
+    inside.chmod(0)
+
+    found = data.look()
+
+    inside.chmod(0o755)
+    assert found.ok, found.lines
+
+
 def test_folders_that_only_look_like_archives_are_left_out(data):
     (data.root / "workspace" / "resources" / "archive_001").mkdir(parents=True)
     (data.root / MAIN / "history" / "notes").mkdir()

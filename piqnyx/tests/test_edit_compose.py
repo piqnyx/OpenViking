@@ -185,9 +185,9 @@ def test_an_image_of_somebody_else_is_refused():
 
 
 def test_a_file_without_the_service_or_its_image_is_refused():
-    assert "services" in refused("version: '3'\n")
-    assert "openviking" in refused(COMPOSE.replace("  openviking:", "  viking:"))
-    assert "image" in refused(
+    assert "нет раздела services" in refused("version: '3'\n")
+    assert "нет сервиса openviking" in refused(COMPOSE.replace("  openviking:", "  viking:"))
+    assert "нет строки image" in refused(
         COMPOSE.replace("    image: ghcr.io/volcengine/openviking:latest\n", "")
     )
 
@@ -260,3 +260,22 @@ def test_the_program_writes_the_new_file_and_says_what_it_did(tmp_path, capsys):
     source.write_text(COMPOSE)
     assert edit_compose.main([*given[:4], "--data-folder"]) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "../data/openviking"
+
+
+def test_the_program_does_not_trust_its_own_edit(tmp_path, capsys, monkeypatch):
+    source = tmp_path / "docker-compose.yml"
+    source.write_text(COMPOSE)
+    new = tmp_path / "new.yml"
+    wrong = edit().text.replace('user: "1001:1001"', 'user: "0:0"')
+    monkeypatch.setattr(
+        edit_compose, "edit", lambda text, **how: edit_compose.Done(wrong, True, "x")
+    )
+
+    code = edit_compose.main(
+        ["--file", str(source), "--service", "openviking", "--image", OURS]
+        + ["--was-of", THEIRS, "--out", str(new)]
+    )
+
+    assert code == 1
+    assert not new.exists()
+    assert "user" in capsys.readouterr().out

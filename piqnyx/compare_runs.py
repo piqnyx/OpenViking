@@ -81,7 +81,7 @@ def _told_of(title: str, run: Run, problems: List[str]) -> str:
     if run.end is not None and "seconds" in run.end:
         line += f", за {run.end['seconds']} с"
 
-    if run.end is None and not run.tests:
+    if run.end is None and not run.tests and not run.unfinished:
         problems.append(f"{title}: прогон ничего не записал")
     elif run.end is None:
         where = f" на тесте {run.unfinished[-1]}" if run.unfinished else ""

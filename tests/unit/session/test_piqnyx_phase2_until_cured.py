@@ -110,14 +110,11 @@ class _Compressor:
         return []
 
 
-@pytest.fixture(autouse=True)
-def _config_of_its_own(monkeypatch, tmp_path):
-    """The phase reads the server's config; give it one that names nothing real."""
-    config = tmp_path / "ov.conf"
-    config.write_text(
+def _write_config(path, workspace, storage=None):
+    path.write_text(
         json.dumps(
             {
-                "storage": {"workspace": str(tmp_path / "data")},
+                "storage": {"workspace": str(workspace), **(storage or {})},
                 "embedding": {
                     "dense": {
                         "provider": "openai",
@@ -136,9 +133,18 @@ def _config_of_its_own(monkeypatch, tmp_path):
             }
         )
     )
-    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", str(config))
     OpenVikingConfigSingleton.reset_instance()
-    yield
+
+
+@pytest.fixture(autouse=True)
+def config_of_its_own(monkeypatch, tmp_path):
+    """The phase reads the server's config; give it one that names nothing real.
+
+    Yields a way to write it anew with other storage settings."""
+    config = tmp_path / "ov.conf"
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", str(config))
+    _write_config(config, tmp_path / "data")
+    yield lambda storage: _write_config(config, tmp_path / "data", storage)
     OpenVikingConfigSingleton.reset_instance()
 
 
@@ -202,6 +208,22 @@ class _Stand:
 
     async def task(self):
         return await self.tracker.get("t1", account_id=self.account, user_id=self.user)
+
+    async def stop_in_the_middle_of_a_wait(self, monkeypatch):
+        """Run the phase, wait until a step is waiting out the storm, and stop it from
+        outside -- the way the queue worker does when the server goes down."""
+        waiting = asyncio.Event()
+
+        async def wait_for_the_stop(_seconds):
+            waiting.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(persistence, "_sleep", wait_for_the_stop)
+        job = asyncio.ensure_future(self.run())
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        job.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await job
 
 
 async def test_a_storm_longer_than_upstream_patience_does_not_fail_the_archive(monkeypatch):
@@ -276,29 +298,32 @@ async def test_a_stop_in_the_middle_of_a_wait_leaves_the_archive_pending(monkeyp
     # hands it out again at the next start; a failed marker would make that start give up.
     stand = _Stand(monkeypatch, memory_failures=[Exception(STORM)] * 8)
 
-    async def stopped(_seconds):
-        raise asyncio.CancelledError()
-
-    monkeypatch.setattr(persistence, "_sleep", stopped)
-
-    with pytest.raises(asyncio.CancelledError):
-        await stand.run()
+    await stand.stop_in_the_middle_of_a_wait(monkeypatch)
 
     assert stand.storage.markers() == []
     assert (await stand.task()).status == TaskStatus.RUNNING
 
 
-async def test_a_cancel_that_was_asked_for_marks_the_archive_as_before(monkeypatch):
+async def test_a_stop_marks_the_archive_when_the_queue_would_forget_the_job(
+    monkeypatch, config_of_its_own
+):
+    # A queue kept in memory does not outlive the server. Nothing would ever take the
+    # archive up again, and the archives after it wait for it without an end: so here
+    # the marker is written as upstream writes it.
+    config_of_its_own({"agfs": {"queuefs": {"backend": "memory"}}})
     stand = _Stand(monkeypatch, memory_failures=[Exception(STORM)] * 8)
 
-    async def cancelled(_seconds):
-        raise asyncio.CancelledError()
+    await stand.stop_in_the_middle_of_a_wait(monkeypatch)
 
-    monkeypatch.setattr(persistence, "_sleep", cancelled)
+    assert stand.storage.markers() == [".failed.json"]
+    assert json.loads(stand.storage.files[f"{ARCHIVE}/.failed.json"])["stage"] == "cancelled"
+
+
+async def test_a_cancel_that_was_asked_for_marks_the_archive_as_before(monkeypatch):
+    stand = _Stand(monkeypatch, memory_failures=[Exception(STORM)] * 8)
     monkeypatch.setattr(stand.tracker, "is_cancellation_requested", lambda task_id: True)
 
-    with pytest.raises(asyncio.CancelledError):
-        await stand.run()
+    await stand.stop_in_the_middle_of_a_wait(monkeypatch)
 
     assert stand.storage.markers() == [".failed.json"]
     assert json.loads(stand.storage.files[f"{ARCHIVE}/.failed.json"])["stage"] == "cancelled"
@@ -335,3 +360,54 @@ async def test_a_blip_is_still_cured_by_upstream_own_quick_repeats(monkeypatch):
     assert waits == []
     assert len(stand.quick_waits) == 2
     assert stand.storage.markers() == [".done"]
+
+
+async def test_an_archive_waiting_for_the_one_before_it_asks_less_and_less_often(monkeypatch):
+    # Upstream looks ten times a second, which is nothing while a Phase 2 takes a minute.
+    # Behind an archive that waits out a storm it would be hours of reading every marker
+    # of the session ten times a second.
+    stand = _Stand(monkeypatch)
+    second = f"{URI}/history/archive_002"
+    stand.storage.files[f"{second}/messages.jsonl"] = stand.message.to_jsonl() + "\n"
+    looks = []
+    real_sleep = asyncio.sleep
+
+    async def clock(seconds, *args, **kwargs):
+        looks.append(seconds)
+        if len(looks) == 9:
+            stand.storage.files[f"{ARCHIVE}/.done"] = json.dumps({})
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", clock)
+
+    assert await stand.session._wait_for_previous_archive_done(2) is True
+    assert looks == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0, 5.0]
+
+
+async def test_while_an_archive_waits_out_a_storm_the_context_is_whole(monkeypatch):
+    # What the whole change rests on: a pending archive gives its raw messages and lets
+    # the last closed summary through; a failed one takes the summary away.
+    stand = _Stand(monkeypatch)
+    files = stand.storage.files
+    closed = Message(id="old", role="user", parts=[TextPart("said long ago")])
+    files[f"{ARCHIVE}/messages.jsonl"] = closed.to_jsonl() + "\n"
+    files[f"{ARCHIVE}/.overview.md"] = "# Summary\nwhat was said long ago"
+    files[f"{ARCHIVE}/.done"] = json.dumps({"working_memory_enabled": True})
+    second = f"{URI}/history/archive_002"
+    waiting = Message(id="stormy", role="user", parts=[TextPart("said during the storm")])
+    files[f"{second}/messages.jsonl"] = waiting.to_jsonl() + "\n"
+    live = Message(id="fresh", role="assistant", parts=[TextPart("said just now")])
+    stand.session._messages = [live]
+
+    context = await stand.session.get_session_context(token_budget=100_000)
+
+    assert context["latest_archive_overview"] == "# Summary\nwhat was said long ago"
+    assert [message["id"] for message in context["messages"]] == ["stormy", "fresh"]
+
+    # The same archive given up on, as upstream gives it up after four calls.
+    files[f"{second}/.failed.json"] = json.dumps({"stage": "memory_extraction", "error": STORM})
+
+    context = await stand.session.get_session_context(token_budget=100_000)
+
+    assert context["latest_archive_overview"] == ""
+    assert [message["id"] for message in context["messages"]] == ["fresh"]

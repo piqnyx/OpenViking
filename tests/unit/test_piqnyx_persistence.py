@@ -284,3 +284,26 @@ async def test_a_listener_that_breaks_does_not_stop_the_repeats(monkeypatch):
         == "done"
     )
     assert clock.waits == [2.0]
+
+
+class _Config:
+    def __init__(self, backend):
+        self.storage = type(
+            "S", (), {"agfs": type("A", (), {"queuefs": type("Q", (), {"backend": backend})()})()}
+        )()
+
+
+@pytest.mark.parametrize(
+    "backend,survives",
+    [("sqlite", True), ("sqlite3", True), ("memory", False), ("", False), (None, False)],
+)
+def test_whether_the_queue_outlives_a_stop(backend, survives):
+    assert persistence.queue_survives_a_stop(lambda: _Config(backend)) is survives
+
+
+def test_a_config_that_cannot_be_read_means_the_queue_is_not_trusted():
+    def broken():
+        raise FileNotFoundError("no config")
+
+    assert persistence.queue_survives_a_stop(broken) is False
+    assert persistence.queue_survives_a_stop(lambda: object()) is False

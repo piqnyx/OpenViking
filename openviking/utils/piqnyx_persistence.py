@@ -148,6 +148,21 @@ def retry_settings() -> Tuple[float, float]:
     return base, cap
 
 
+def queue_survives_a_stop(read_config: Callable[[], Any]) -> bool:
+    """Whether a job taken from the commit queue is handed out again after a restart.
+
+    Only then may an archive be left pending when the server is stopped in the
+    middle of its Phase 2. A queue kept in memory forgets the job, nothing would
+    ever take the archive up again, and the archives after it wait for it without
+    an end. Anything that cannot be read is taken for a queue that forgets.
+    """
+    try:
+        backend = read_config().storage.agfs.queuefs.backend
+    except Exception:
+        return False
+    return isinstance(backend, str) and backend.strip().lower() in ("sqlite", "sqlite3")
+
+
 async def until_cured(
     fn: Callable[[], Awaitable[T]],
     *,

@@ -368,6 +368,9 @@ def test_what_is_asked_of_pytest_names_no_test_of_ours_twice():
     ]
     assert runner.what_to_run("new", common, ours) == common + ["tests/apart/test_ours.py"]
     assert runner.what_to_run("new", ["tests/unit/session/"], ours[:1]) == ["tests/unit/session/"]
+    assert runner.what_to_run("new", ["tests/apart/test_ours.py"], ours[3:]) == [
+        "tests/apart/test_ours.py"
+    ]
     assert runner.what_to_run("old", ["tests/unit/session"], ours[:2]) == [
         "tests/unit/session",
         "--ignore=tests/unit/session/test_ours.py",

@@ -30,9 +30,13 @@ docker buildx version > /dev/null 2>&1 ||
 docker image inspect "$BASE" > /dev/null 2>&1 ||
     stop "исходного образа нет на диске. Вернуть его: docker pull $BASE"
 
-used="$(docker ps -a --filter "ancestor=$IMAGE" --format '{{.Names}}')"
-[ -z "$used" ] || stop "образ $IMAGE уже в работе у контейнера: $used
+# Asked only of an image that is there: the first build has nothing to be in work.
+if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+    used="$(docker ps -a --filter "ancestor=$IMAGE" --format '{{.Names}}')" ||
+        stop "docker не ответил, какие контейнеры работают на образе $IMAGE"
+    [ -z "$used" ] || stop "образ $IMAGE уже в работе у контейнера: $used
 Новая сборка берёт новую версию: строка VERSION в piqnyx/image.conf"
+fi
 
 commit="$(git rev-parse HEAD)"
 echo "собираю $IMAGE из коммита $commit"

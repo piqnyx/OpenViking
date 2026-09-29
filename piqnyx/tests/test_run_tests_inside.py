@@ -20,6 +20,10 @@ compare_runs = importlib.util.module_from_spec(spec)
 sys.modules["compare_runs"] = compare_runs
 spec.loader.exec_module(compare_runs)
 
+spec = importlib.util.spec_from_file_location("run_tests_inside", RUNNER)
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
 MADE_UP = """
 import os
 import sys
@@ -344,6 +348,31 @@ def test_in_the_new_image_ours_are_run_and_each_test_once(two_sides):
     begun = [line for line in two_sides.done.stderr.splitlines() if '"started"' in line]
     assert len(begun) == 4
     assert read.end["status"] == 0
+
+
+def test_what_is_asked_of_pytest_names_no_test_of_ours_twice():
+    # pytest 9.1.1 runs a file once though it is named twice; an older one need not.
+    common = ["tests/unit/session", "tests/unit/test_model_retry.py", "tests/unit"]
+    ours = [
+        "tests/unit/session/test_ours.py",
+        "tests/unit/sessions_of_ours/test_ours.py",
+        "tests/unit/test_model_retry.py",
+        "tests/apart/test_ours.py",
+    ]
+
+    assert runner.what_to_run("new", ["tests/unit/session"], ours) == [
+        "tests/unit/session",
+        "tests/unit/sessions_of_ours/test_ours.py",
+        "tests/unit/test_model_retry.py",
+        "tests/apart/test_ours.py",
+    ]
+    assert runner.what_to_run("new", common, ours) == common + ["tests/apart/test_ours.py"]
+    assert runner.what_to_run("new", ["tests/unit/session/"], ours[:1]) == ["tests/unit/session/"]
+    assert runner.what_to_run("old", ["tests/unit/session"], ours[:2]) == [
+        "tests/unit/session",
+        "--ignore=tests/unit/session/test_ours.py",
+        "--ignore=tests/unit/sessions_of_ours/test_ours.py",
+    ]
 
 
 def test_a_name_of_the_list_that_is_not_there_fails_the_run(two_sides):

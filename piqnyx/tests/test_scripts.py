@@ -237,7 +237,7 @@ def test_a_fork_without_the_tag_stops_the_build(fork):
     done = fork.run("build.sh")
 
     assert done.returncode != 0
-    assert FACTS["TAG"] in done.stderr
+    assert FACTS["TAG"] in done.stderr and "git fetch --tags" in done.stderr
     assert fork.calls("build") == []
 
 
@@ -289,6 +289,18 @@ def test_a_fact_that_is_missing_stops_the_build(fork, fact):
 
     assert done.returncode != 0
     assert fact in done.stderr
+    assert fork.calls("build") == []
+
+
+def test_a_fact_given_twice_stops_the_build(fork):
+    with fork.path("piqnyx/image.conf").open("a") as facts:
+        facts.write("VERSION=0.0.0-test.2\n")
+    fork.commit("a fact doubled")
+
+    done = fork.run("build.sh")
+
+    assert done.returncode != 0
+    assert "VERSION" in done.stderr and "2 раз" in done.stderr
     assert fork.calls("build") == []
 
 
@@ -426,14 +438,16 @@ def test_packages_kept_in_another_place_stop_the_check(fork):
     assert "/somewhere/else/site-packages" in done.stderr and SITE in done.stderr
 
 
-def test_a_listing_that_failed_is_not_compared(fork):
-    fork.scenario["listing_code"] = 1
+@pytest.mark.parametrize("kind", ["sha", "ent"])
+def test_a_listing_that_failed_is_not_compared(fork, kind):
+    fork.scenario["listing_codes"] = {kind: 1}
 
     done = fork.run("verify-image.sh")
 
     assert done.returncode != 0
     assert "ИТОГ: образ --" not in done.stdout
-    assert "список файлов" in done.stderr
+    assert "не получен" in done.stderr
+    assert ("с правами" in done.stderr) == (kind == "ent")
 
 
 def test_every_check_is_taken_anew(fork):
@@ -444,6 +458,27 @@ def test_every_check_is_taken_anew(fork):
 
     assert done.returncode != 0
     assert "surprise" in done.stdout
+
+
+def test_what_an_earlier_check_left_is_not_counted(fork):
+    first = fork.run("verify-image.sh")
+    assert first.returncode == 0
+    fork.put("piqnyx/.work/check/tag/openviking/left_by_an_earlier_check.py", "stale\n")
+
+    second = fork.run("verify-image.sh")
+
+    assert second.returncode == 0
+    assert second.stdout == first.stdout
+
+
+def test_a_fork_without_the_tag_stops_the_check(fork):
+    fork.git("tag", "-d", FACTS["TAG"])
+
+    done = fork.run("verify-image.sh")
+
+    assert done.returncode != 0
+    assert FACTS["TAG"] in done.stderr and "git fetch --tags" in done.stderr
+    assert fork.calls("run") == []
 
 
 def test_the_check_leaves_the_fork_as_it_was(fork):

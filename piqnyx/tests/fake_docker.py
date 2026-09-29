@@ -65,7 +65,7 @@ def main(argv):
         said = " ".join(command)
         if "sha256sum" in said or "-printf" in said:
             kind = "sha" if "sha256sum" in said else "ent"
-            code = scenario.get("listing_code", 0)
+            code = scenario.get("listing_codes", {}).get(kind, 0)
             with open(os.path.join(home, f"{image['side']}.{kind}"), encoding="utf-8") as source:
                 return done(code, source.read())
         if "cache_tag" in said:

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 
 def main(argv):
@@ -61,6 +62,9 @@ def main(argv):
     if argv[:1] == ["build"]:
         return done(scenario.get("build_code", 0), "fake build\n")
 
+    if argv[:1] == ["rm"]:
+        return done(0)
+
     if argv[:1] == ["run"]:
         at = next((n for n, item in enumerate(argv) if n and item in images), None)
         if at is None:
@@ -77,6 +81,32 @@ def main(argv):
             return done(0, scenario["cache_tag"] + "\n")
         if "purelib" in said:
             return done(0, scenario["site"] + "\n")
+        if "pip" in command and "install" in command:
+            code = scenario.get("tools_code", 0)
+            into = [item.split(":")[0] for item in argv if item.endswith(":/tools")]
+            if code == 0 and into:
+                os.makedirs(os.path.join(into[0], "pytest"), exist_ok=True)
+                with open(os.path.join(into[0], "pytest", "__init__.py"), "w") as made:
+                    made.write("# put here by the stand-in for docker\n")
+            return done(code, err="" if code == 0 else "ERROR: no network in the stand-in\n")
+        if any(item.endswith("run_tests_inside.py") for item in command):
+            side = command[command.index("--side") + 1]
+            call["side"] = side
+            records = os.path.join(home, f"{side}.rec")
+            told = ""
+            if os.path.exists(records):
+                with open(records, encoding="utf-8") as source:
+                    told = source.read()
+            # A run that takes its time writes its records down as it goes.
+            lasts = scenario.get("tests_last", 0)
+            if lasts:
+                half = len(told) // 2
+                cut = told.rfind("\n", 0, half) + 1
+                sys.stderr.write(told[:cut])
+                sys.stderr.flush()
+                time.sleep(lasts)
+                told = told[cut:]
+            return done(scenario.get("tests_code", {}).get(side, 1), "fake talk of pytest\n", told)
         if command[:1] == ["-"]:
             given = sys.stdin.buffer.read()
             call["stdin_sha256"] = hashlib.sha256(given).hexdigest()

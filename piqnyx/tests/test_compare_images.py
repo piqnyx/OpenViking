@@ -274,7 +274,7 @@ def test_settings_that_cannot_be_read_are_a_failure_not_a_pass(images):
     report = images.report()
 
     assert not report.ok
-    assert any("настройки" in line for line in report.problems)
+    assert any("параметры запуска" in line for line in report.problems)
 
 
 def test_the_file_we_replace_must_be_the_one_of_the_tag(images):
@@ -325,7 +325,60 @@ def test_files_of_the_tag_the_image_never_had_are_counted_not_blamed(images):
 
     assert report.ok, report.text
     assert "совпало 2 из 2" in report.text
-    assert "в образ не ставились: 1" in report.text
+    assert "в образ не ставились: 1 (.md 1)" in report.text
+    assert report.absent == ["openviking/docs/only-in-the-source.md"]
+
+
+def test_files_of_the_tag_the_image_never_had_are_told_by_kind(images):
+    for name in ("queries/b.scm", "queries/a.scm", "queries/c.scm", "README.md", "run", "x.sh"):
+        path = images.tag / "openviking" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("never installed")
+
+    report = images.report()
+
+    assert report.ok, report.text
+    assert "в образ не ставились: 7 (.scm 3, .md 2, .sh 1, без расширения 1)" in report.text
+    assert report.absent == sorted(report.absent) and len(report.absent) == 7
+
+
+def test_the_settings_that_were_compared_are_named(images):
+    report = images.report()
+
+    assert (
+        "параметров запуска образа сверено: 7 "
+        "(Cmd, Entrypoint, Env, ExposedPorts, Healthcheck, User, WorkingDir)"
+    ) in report.text
+
+
+def test_the_names_of_the_files_the_image_never_had_are_written_out(images, tmp_path):
+    listings = {}
+    for name, text in (
+        ("old.sha", files_of(images.old)),
+        ("new.sha", files_of(images.new)),
+        ("old.ent", entries_of(images.old)),
+        ("new.ent", entries_of(images.new)),
+        ("old.json", json.dumps(images.old_config)),
+        ("new.json", json.dumps(images.new_config)),
+        ("overlay.txt", "\n".join(OURS) + "\n"),
+    ):
+        listings[name] = tmp_path / name
+        listings[name].write_text(text)
+    names = tmp_path / "never-there.txt"
+
+    code = compare_images.main(
+        [
+            "--old-files", str(listings["old.sha"]), "--new-files", str(listings["new.sha"]),
+            "--old-entries", str(listings["old.ent"]), "--new-entries", str(listings["new.ent"]),
+            "--old-config", str(listings["old.json"]), "--new-config", str(listings["new.json"]),
+            "--overlay", str(listings["overlay.txt"]), "--site", SITE, "--cache-tag", TAG,
+            "--source-root", str(images.root), "--tag-root", str(images.tag),
+            "--absent-to", str(names),
+        ]
+    )  # fmt: skip
+
+    assert code == 0
+    assert names.read_text() == "openviking/docs/only-in-the-source.md\n"
 
 
 def test_a_label_of_the_running_image_must_stay_as_it_was(images):

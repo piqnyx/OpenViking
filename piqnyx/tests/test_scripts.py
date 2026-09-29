@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from test_compare_images import OURS, SITE, TAG, Images, entries_of, files_of
+from test_compare_runs import records
 
 HERE = Path(__file__).resolve().parent
 RECIPE = HERE.parent
@@ -29,10 +30,14 @@ CARRIED = (
     "common.sh",
     "build.sh",
     "verify-image.sh",
+    "test-in-image.sh",
     "lay_over.sh",
     "check_list.py",
     "compare_images.py",
     "inside_check.py",
+    "run_tests_inside.py",
+    "compare_runs.py",
+    "test-ov.conf",
 )
 FACTS = {
     "TAG": "v0.4.12",
@@ -42,6 +47,11 @@ FACTS = {
     "RUN_AS": "1001:1001",
     "NAME": "piqnyx/openviking",
     "VERSION": "0.0.0-test.1",
+    "TEST_TOOLS": "pytest==0.0.1 pytest-helper==0.0.2",
+    "TEST_EACH": "45",
+    "TEST_LONGEST": "7",
+    "TEST_CPUS": "2",
+    "TEST_MEMORY": "3g",
 }
 OUR_IMAGE = f"{FACTS['NAME']}:{FACTS['VERSION']}"
 
@@ -59,6 +69,9 @@ class Fork:
             self.put(name, text)
         self.put("openviking_cli/__init__.py", "")
         self.put("docker/openviking-entrypoint.sh", "#!/bin/sh\n")
+        self.put("pyproject.toml", "[tool.pytest.ini_options]\n")
+        self.put("tests/unit/test_theirs.py", "def test_one():\n    pass\n")
+        self.put("tests/session/test_theirs.py", "def test_one():\n    pass\n")
         self.commit("upstream at the tag")
         self.git("tag", FACTS["TAG"])
         self.git("checkout", "-q", "-b", "piqnyx/0.4.12")
@@ -67,8 +80,15 @@ class Fork:
         for name in CARRIED:
             shutil.copy(RECIPE / name, self.path("piqnyx", name))
         self.put("piqnyx/overlay.txt", "\n".join(OURS) + "\n")
+        self.put("piqnyx/tests-inside.txt", "tests/unit\ntests/session/test_theirs.py\n")
+        self.put("tests/unit/test_ours.py", "def test_one():\n    pass\n")
         self.facts()
         self.commit("ours")
+        self.theirs = {
+            "tests/unit/test_theirs.py::test_one": "passed",
+            "tests/session/test_theirs.py::test_one": "failed",
+        }
+        self.mine = {"tests/unit/test_ours.py::test_one": "passed"}
 
         self.docker = tmp_path / "docker"
         self.docker.mkdir()
@@ -116,14 +136,19 @@ class Fork:
         self.git("add", "-A")
         self.git("commit", "-q", "-m", message)
 
-    def run(self, script, cwd=None):
+    def run(self, script, cwd=None, **more):
         (self.docker / "scenario.json").write_text(json.dumps(self.scenario))
         for side, image in (("old", self.images.old), ("new", self.images.new)):
             (self.docker / f"{side}.sha").write_text(files_of(image))
             (self.docker / f"{side}.ent").write_text(entries_of(image))
+        if self.theirs is not None:
+            (self.docker / "old.rec").write_text(records(self.theirs))
+            (self.docker / "new.rec").write_text(records({**self.theirs, **self.mine}))
         env = dict(
             os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_DOCKER=str(self.docker)
         )
+        env.pop("PIQNYX_TELL_EVERY", None)
+        env.update(more)
         return subprocess.run(
             ["bash", str(self.root / "piqnyx" / script)],
             cwd=cwd or self.root,
@@ -345,8 +370,15 @@ def test_an_image_that_is_what_it_claims_passes_the_check(fork):
     assert "ИТОГ: образ -- прежний плюс наши файлы, больше ничего" in done.stdout
     assert "ИТОГ: сервер в образе берёт наши файлы" in done.stdout
     assert "исходный образ сверен с тегом: совпало 2 из 2" in done.stdout
+    assert "параметров запуска образа сверено: 7" in done.stdout
     last = done.stdout.strip().splitlines()[-1]
     assert "ИТОГ ПРОВЕРКИ" in last and OUR_IMAGE in last and "ОСТАНОВКА" not in last
+    names = fork.root / "piqnyx" / ".work" / "check" / "not-in-base.txt"
+    assert names.read_text().splitlines() == [
+        "openviking/docs/only-in-the-source.md",
+        "openviking_cli/__init__.py",
+    ]
+    assert "piqnyx/.work/check/not-in-base.txt" in done.stdout
 
 
 def test_the_check_asks_docker_for_what_we_mean(fork):
@@ -498,3 +530,230 @@ def test_the_check_leaves_the_fork_as_it_was(fork):
 
     assert fork.git("status", "--porcelain", "--untracked-files=all") == before == ""
     assert (fork.root / "piqnyx" / ".work" / "check" / "new.sha").is_file()
+
+
+# -------------------------------------------------------- test-in-image.sh
+
+
+def test_tests_that_give_the_same_in_both_images_pass(fork):
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "общих тестов 2: исход одинаков у 2" in done.stdout
+    assert "наших тестов в новом образе 1: прошли 1" in done.stdout
+    assert done.stdout.count("кончено: есть упавшие тесты") == 2
+    last = done.stdout.strip().splitlines()[-1]
+    assert "ИТОГ ТЕСТОВ" in last and "ОСТАНОВКА" not in last
+
+
+def test_how_a_run_ended_is_told_in_words(fork):
+    fork.scenario["tests_code"] = {"old": 0, "new": 137}
+
+    done = fork.run("test-in-image.sh")
+
+    assert "кончено: все тесты прошли" in done.stdout
+    assert "кончено с кодом 137" in done.stdout
+
+
+def test_a_long_run_tells_how_far_it_has_got(fork):
+    fork.scenario["tests_last"] = 2.5
+
+    done = fork.run("test-in-image.sh", PIQNYX_TELL_EVERY="1")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    told = [line for line in done.stdout.splitlines() if "тестов записано" in line]
+    assert len(told) >= 2
+    assert any("тестов записано 1" in line for line in told)
+    assert "общих тестов 2: исход одинаков у 2" in done.stdout
+
+
+def test_a_short_run_tells_nothing_in_between(fork):
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "тестов записано" not in done.stdout
+
+
+def test_the_tools_are_the_only_thing_taken_from_the_network(fork):
+    assert fork.run("test-in-image.sh").returncode == 0
+
+    runs = fork.calls("run")
+    (tools,) = [run for run in runs if "pip" in run["argv"]]
+    assert after(tools["argv"], "--network") == ["host"]
+    assert after(tools["argv"], "--user") == [f"{os.getuid()}:{os.getgid()}"]
+    assert tools["image"] == FACTS["BASE"]
+    given = tools["argv"][tools["argv"].index("install") :]
+    assert given[-2:] == ["pytest==0.0.1", "pytest-helper==0.0.2"]
+    assert after(tools["argv"], "-v") == [f"{fork.root}/piqnyx/.work/tests/tools:/tools"]
+    for run in runs:
+        if run is not tools:
+            assert after(run["argv"], "--network") == ["none"], run["argv"]
+
+
+def test_the_tests_run_as_the_server_does_and_can_write_nowhere_on_the_disk(fork):
+    assert fork.run("test-in-image.sh").returncode == 0
+
+    inside = [run for run in fork.calls("run") if "side" in run]
+    assert [(run["side"], run["image"]) for run in inside] == [
+        ("old", FACTS["BASE"]),
+        ("new", OUR_IMAGE),
+    ]
+    for run in inside:
+        argv = run["argv"]
+        assert "--rm" in argv
+        assert after(argv, "--user") == [FACTS["RUN_AS"]]
+        assert after(argv, "--cpus") == [FACTS["TEST_CPUS"]]
+        assert after(argv, "--memory") == [FACTS["TEST_MEMORY"]]
+        assert after(argv, "--each") == [FACTS["TEST_EACH"]]
+        mounts = after(argv, "-v")
+        assert mounts and all(mount.endswith(":ro") for mount in mounts), mounts
+        assert f"{fork.root}/tests:/src/tests:ro" in mounts
+        assert f"{fork.root}/piqnyx/.work/tests/tools:/tools:ro" in mounts
+        (scratch,) = after(argv, "--tmpfs")
+        assert (
+            scratch.startswith("/src/test_data:")
+            and "uid=1001" in scratch
+            and "gid=1001" in scratch
+        )
+        assert "OPENVIKING_CONFIG_FILE=/src/ov.conf" in after(argv, "-e")
+        assert "HOME=/src/test_data/home" in after(argv, "-e")
+        assert not any(item in ("-p", "--publish", "--privileged") for item in argv)
+
+
+def test_a_test_that_gives_another_thing_in_our_image_stops_the_work(fork):
+    fork.theirs = None
+    fork.docker.joinpath("old.rec").write_text(
+        records({"tests/unit/test_theirs.py::test_one": "passed"})
+    )
+    fork.docker.joinpath("new.rec").write_text(
+        records({"tests/unit/test_theirs.py::test_one": "failed", **fork.mine})
+    )
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert "было passed, стало failed: tests/unit/test_theirs.py::test_one" in done.stdout
+    assert "ОСТАНОВКА" in done.stdout.strip().splitlines()[-1]
+
+
+def test_a_run_that_was_cut_short_stops_the_work(fork):
+    fork.theirs = None
+    name = "tests/unit/test_theirs.py::test_one"
+    fork.docker.joinpath("old.rec").write_text(records({name: "passed"}))
+    fork.docker.joinpath("new.rec").write_text(records({name: "passed", **fork.mine}, cut_at=name))
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert "оборван" in done.stdout and name in done.stdout
+
+
+def test_tools_that_did_not_come_stop_the_tests(fork):
+    fork.scenario["tools_code"] = 1
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert "инструменты" in done.stderr
+    assert [run for run in fork.calls("run") if "side" in run] == []
+
+
+@pytest.mark.parametrize("gone", ["ours", "base"])
+def test_an_image_that_is_not_on_the_disk_stops_the_tests(fork, gone):
+    name = OUR_IMAGE if gone == "ours" else FACTS["BASE"]
+    del fork.scenario["images"][name]
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert name in done.stderr
+    assert fork.calls("run") == []
+
+
+def test_a_branch_that_added_no_tests_stops_the_tests(fork):
+    fork.git("rm", "-q", "tests/unit/test_ours.py")
+    fork.commit("our test taken away")
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert "не добавила" in done.stderr
+    assert fork.calls("run") == []
+
+
+@pytest.mark.parametrize(
+    "name, word",
+    [
+        ("tests/unit/test_ours.py", "не из тега"),
+        ("tests/no_such_tests", "не из тега"),
+        ("", "пуст"),
+    ],
+)
+def test_a_list_of_common_tests_that_is_not_of_upstream_stops_the_tests(fork, name, word):
+    fork.put("piqnyx/tests-inside.txt", f"{name}\n")
+    fork.commit("the list changed")
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert word in done.stderr
+    assert fork.calls("run") == []
+
+
+def test_every_run_of_the_tests_is_taken_anew(fork):
+    assert fork.run("test-in-image.sh").returncode == 0
+    fork.put("piqnyx/.work/tests/tools/left_by_a_run_before.py", "stale\n")
+    fork.theirs = None
+    fork.docker.joinpath("new.rec").unlink()
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode != 0
+    assert "новый образ: прогон ничего не записал" in done.stdout
+    tools = fork.root / "piqnyx" / ".work" / "tests" / "tools"
+    assert sorted(path.name for path in tools.iterdir()) == ["pytest"]
+
+
+def test_the_tests_of_ours_are_the_test_files_our_branch_added(fork):
+    fork.put("tests/unit/helpers_of_ours.py", "VALUE = 1\n")
+    fork.put("tests/unit/fixtures/made_by_us.json", "{}\n")
+    fork.put("tests/unit/test_theirs.py", "def test_one():\n    assert True\n")
+    fork.put("tests/deep/er/test_ours_too.py", "def test_one():\n    pass\n")
+    fork.commit("more of ours, and one of theirs changed")
+    fork.mine["tests/deep/er/test_ours_too.py::test_one"] = "passed"
+
+    done = fork.run("test-in-image.sh")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    ours = (fork.root / "piqnyx" / ".work" / "tests" / "ours.txt").read_text().splitlines()
+    assert sorted(ours) == ["tests/deep/er/test_ours_too.py", "tests/unit/test_ours.py"]
+
+
+def test_containers_left_by_a_run_before_are_put_away(fork):
+    assert fork.run("test-in-image.sh").returncode == 0
+
+    story = []
+    for call in fork.calls():
+        if call["argv"][0] == "rm":
+            story.append(("put away", call["argv"][-1]))
+        elif "side" in call:
+            story.append(("run", after(call["argv"], "--name")[0]))
+    assert story[:6] == [
+        ("put away", "piqnyx-ov-tests-old"),
+        ("run", "piqnyx-ov-tests-old"),
+        ("put away", "piqnyx-ov-tests-old"),
+        ("put away", "piqnyx-ov-tests-new"),
+        ("run", "piqnyx-ov-tests-new"),
+        ("put away", "piqnyx-ov-tests-new"),
+    ]
+    assert set(story[6:]) == {
+        ("put away", "piqnyx-ov-tests-old"),
+        ("put away", "piqnyx-ov-tests-new"),
+    }
+
+
+def test_the_tests_leave_the_fork_as_it_was(fork):
+    assert fork.run("test-in-image.sh").returncode == 0
+
+    assert fork.git("status", "--porcelain", "--untracked-files=all") == ""
+    assert (fork.root / "piqnyx" / ".work" / "tests" / "new.rec").is_file()

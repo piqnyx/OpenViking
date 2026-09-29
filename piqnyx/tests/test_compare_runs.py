@@ -161,17 +161,11 @@ def test_talk_that_is_not_a_record_is_left_out():
 
 def test_a_test_written_down_twice_keeps_the_worse_of_the_two():
     name = "tests/unit/test_model_retry.py::test_retry"
-    twice = records(COMMON, noise=False).replace(
-        "@@piqnyx " + json.dumps({"kind": "end", "status": 1, "seconds": 12.5}),
-        "@@piqnyx "
-        + json.dumps({"kind": "test", "id": name, "outcome": "error", "why": "again"})
-        + "\n@@piqnyx "
-        + json.dumps({"kind": "end", "status": 1, "seconds": 12.5}),
-    )
+    worse = "@@piqnyx " + json.dumps({"kind": "test", "id": name, "outcome": "error", "why": "x"})
+    once = records(COMMON, noise=False)
 
-    read = compare_runs.read(twice)
-
-    assert read.tests[name] == ("error", "again")
+    assert compare_runs.read(once + worse + "\n").tests[name] == ("error", "x")
+    assert compare_runs.read(worse + "\n" + once).tests[name] == ("error", "x")
 
 
 def test_many_differences_are_counted_and_the_first_are_shown():

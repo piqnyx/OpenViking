@@ -54,7 +54,7 @@ def test_cannot_finish(breaks_after):
     pass
 
 
-@pytest.mark.skip(reason="not today")
+@pytest.mark.skip(reason="not today\\nnor tomorrow")
 def test_is_skipped():
     pass
 
@@ -77,6 +77,15 @@ def test_with_a_value(given):
 def test_talks_like_a_record():
     sys.stderr.write('@@piqnyx {"kind": "test", "id": "forged", "outcome": "passed"}\\n')
     os.write(2, b'@@piqnyx {"kind": "end", "status": 0}\\n')
+
+
+def test_fails_with_many_words():
+    raise RuntimeError("first line " + "x" * 1000 + "\\nsecond line\\nthird line")
+
+
+def test_leaves_a_line_unfinished(capfd):
+    with capfd.disabled():
+        os.write(2, b"talk that got out and has no end of line")
 """
 
 
@@ -90,11 +99,13 @@ class Run:
     def put(self, name, text):
         (self.root / name).write_text(text)
 
-    def run(self, *args, tools=None, timeout=120):
+    def run(self, *args, tools=None, each=None, timeout=120):
         command = [sys.executable, "-B", str(RUNNER)]
         if tools is not None:
             command += ["--tools", str(tools)]
-        command += ["--", "-q", "-p", "no:cacheprovider", "-o", "addopts=", *args]
+        if each is not None:
+            command += ["--each", str(each)]
+        command += ["--", *args]
         self.done = subprocess.run(
             command,
             cwd=self.root,
@@ -131,7 +142,7 @@ def test_what_became_of_every_test_is_written_down(run):
     assert outcome(read, "test_is_skipped") == "skipped"
     assert outcome(read, "test_fails_as_expected") == "xfailed"
     assert outcome(read, "test_passes_against_expectation") == "xpassed"
-    assert len(read.tests) == 12
+    assert len(read.tests) == 14
     assert read.end is not None and read.end["status"] == 1
     assert read.unfinished == []
 
@@ -143,6 +154,10 @@ def test_the_reason_of_a_failure_is_kept_in_one_line(run):
     assert "one is not two" in reasons["test_fails"]
     assert "the fixture broke" in reasons["test_cannot_start"]
     assert "the fixture broke after the test" in reasons["test_cannot_finish"]
+    assert reasons["test_is_skipped"].endswith("not today nor tomorrow")
+    assert reasons["test_fails_as_expected"] == "known to fail"
+    assert reasons["test_fails_with_many_words"].startswith("RuntimeError: first line xxx")
+    assert len(reasons["test_fails_with_many_words"]) == 300
     assert all("\n" not in why and len(why) <= 300 for why in reasons.values())
 
 
@@ -166,6 +181,14 @@ def test_what_a_test_says_is_not_taken_for_a_record(run):
     assert read.end["status"] == 1
 
 
+def test_talk_without_an_end_of_line_does_not_swallow_a_record(run):
+    read = run.run("test_made_up.py")
+
+    assert "talk that got out and has no end of line" in run.done.stderr
+    assert outcome(read, "test_leaves_a_line_unfinished") == "passed"
+    assert read.unfinished == []
+
+
 def test_what_pytest_says_goes_the_other_way(run):
     run.run("test_made_up.py")
 
@@ -181,6 +204,37 @@ def test_a_file_that_cannot_be_read_as_tests_is_an_error(run):
     assert read.tests["test_broken_file.py"][0] == "error"
     assert "no_such_module_anywhere" in read.tests["test_broken_file.py"][1]
     assert outcome(read, "test_passes") == "passed"
+
+
+def test_the_options_of_the_fork_are_set_aside(run):
+    run.put("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "--no-such-option-anywhere"\n')
+
+    read = run.run("test_made_up.py")
+
+    assert read.end["status"] == 1
+    assert outcome(read, "test_passes") == "passed"
+
+
+def test_nothing_is_left_beside_the_tests(run):
+    run.run("test_made_up.py")
+
+    assert sorted(path.name for path in run.root.iterdir()) == ["test_made_up.py"]
+
+
+def test_a_test_that_takes_too_long_is_cut_and_the_run_goes_on(run):
+    pytest.importorskip("pytest_timeout")
+    run.put(
+        "test_slow.py",
+        "import time\n\n\ndef test_sleeps():\n    time.sleep(30)\n\n\n"
+        "def test_after():\n    pass\n",
+    )
+
+    read = run.run("test_slow.py", each=1)
+
+    assert outcome(read, "test_sleeps") == "failed"
+    assert "Timeout" in read.tests["test_slow.py::test_sleeps"][1]
+    assert outcome(read, "test_after") == "passed"
+    assert read.end["status"] == 1
 
 
 def test_a_run_that_was_cut_short_says_where(run):
@@ -224,12 +278,18 @@ def test_the_tools_are_found_where_they_were_put(run, tmp_path):
 def test_what_the_image_has_is_taken_before_what_the_tools_bring(run, tmp_path):
     tools = tmp_path / "tools"
     tools.mkdir()
-    (tools / "json.py").write_text("raise RuntimeError('the tools must not shadow the image')\n")
+    # A module of the image that nothing has loaded by the time the tests begin.
+    (tools / "colorsys.py").write_text("raise RuntimeError('the tools shadow the image')\n")
     run.put(
-        "test_json.py", "def test_json_is_the_real_one():\n    import json\n\n    json.dumps({})\n"
+        "test_shadow.py",
+        "def test_the_module_is_the_real_one():\n"
+        "    import colorsys\n\n"
+        "    assert colorsys.rgb_to_hsv(0, 0, 0) == (0.0, 0.0, 0)\n",
     )
 
-    assert outcome(run.run("test_json.py", tools=tools), "test_json_is_the_real_one") == "passed"
+    read = run.run("test_shadow.py", tools=tools)
+
+    assert outcome(read, "test_the_module_is_the_real_one") == "passed"
 
 
 def test_a_home_that_is_asked_for_is_made(run, tmp_path, monkeypatch):

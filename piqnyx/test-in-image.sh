@@ -59,8 +59,11 @@ put_away() {
 }
 trap put_away EXIT
 
+# A run takes a quarter of an hour and more: it tells how far it has got, not to look hung.
+tell_every="${PIQNYX_TELL_EVERY:-60}"
+
 inside() {
-    local side="$1" image="$2" name="piqnyx-ov-tests-$1" code=0
+    local side="$1" image="$2" name="piqnyx-ov-tests-$1" code=0 run waited=0
     echo "гоняю тесты в образе $image, не дольше $TEST_LONGEST мин"
     docker rm -f "$name" > /dev/null 2>&1 || true
     timeout --signal=TERM --kill-after=30 "${TEST_LONGEST}m" \
@@ -80,9 +83,22 @@ inside() {
         --workdir /src --entrypoint python "$image" \
         /src/run_tests_inside.py --tools /tools --each "$TEST_EACH" \
         --side "$side" --common /src/common.txt --ours /src/ours.txt \
-        > "$out/$side.out" 2> "$out/$side.rec" || code=$?
+        > "$out/$side.out" 2> "$out/$side.rec" &
+    run=$!
+    while kill -0 "$run" 2> /dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+        if [ $((waited % tell_every)) -eq 0 ] && kill -0 "$run" 2> /dev/null; then
+            echo "  идёт $((waited / 60)) мин $((waited % 60)) с, тестов записано $(grep -c '"kind": "test"' "$out/$side.rec" || true)"
+        fi
+    done
+    wait "$run" || code=$?
     docker rm -f "$name" > /dev/null 2>&1 || true
-    echo "  кончено с кодом $code, записей $(grep -c '^@@piqnyx ' "$out/$side.rec" || true)"
+    case "$code" in
+        0) echo "  кончено: все тесты прошли" ;;
+        1) echo "  кончено: есть упавшие тесты" ;;
+        *) echo "  кончено с кодом $code: прогон не состоялся как положено" ;;
+    esac
 }
 
 inside old "$BASE"

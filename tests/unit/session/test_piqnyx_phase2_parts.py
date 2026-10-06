@@ -133,13 +133,22 @@ class _Storage:
         return json.loads(raw) if raw else None
 
 
+STORM = (
+    "Error code: 503 - [{'error': {'code': 503, 'message': 'This model is currently experiencing "
+    "high demand. Spikes in demand are usually temporary. Please try again later.', "
+    "'status': 'UNAVAILABLE'}}]"
+)
+
+
 class _Compressor:
     """Long-term extraction the door takes only up to `limit` messages at once."""
 
-    def __init__(self, limit=8, heavy=None, fail_on=None):
+    def __init__(self, limit=8, heavy=None, fail_on=None, storms_on=None, storms=0):
         self.limit = limit
         self.heavy = heavy or (lambda part: len(part) > self.limit)
         self.fail_on = fail_on
+        self.storms_on = storms_on
+        self.storms = storms
         self.calls = []
 
     async def extract_long_term_memories(self, messages, **kwargs):
@@ -147,6 +156,9 @@ class _Compressor:
         self.calls.append(part)
         if self.fail_on is not None and self.fail_on(part):
             raise ValueError("broken json from the model")
+        if self.storms and self.storms_on is not None and self.storms_on(part):
+            self.storms -= 1
+            raise Exception(STORM)
         if self.heavy(messages):
             raise TooHeavyForTheDoor(len(messages) * 1000, self.limit * 1000, "handle")
         return []
@@ -349,3 +361,36 @@ async def test_a_single_turn_too_heavy_fails_the_step_for_good_and_keeps_the_par
     assert failed is not None
     assert failed["completed_memory_steps"]["long_term"] == ["a1", "a2", "u1", "u2"]
     assert ["u4", "a4"] not in compressor.calls
+
+
+@pytest.mark.asyncio
+async def test_a_storm_inside_a_part_is_waited_out_and_the_part_is_marked_once(monkeypatch):
+    # PLAN-gorizont 3в: waiting cures the door and the road, part by part. Stage 1's
+    # repeats live inside the part now: the second half meets the storm twice, is
+    # repeated in place, passes, and the archive completes with every part marked.
+    from openviking.utils import piqnyx_persistence as persistence
+
+    compressor = _Compressor(
+        limit=4, storms_on=lambda part: part == ["u3", "a3", "u4", "a4"], storms=2
+    )
+    stand = _Stand(monkeypatch, compressor=compressor, summary_limit=8)
+    stand.archive_with(1, FOUR_TURNS)
+    waits = []
+
+    async def no_wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(persistence, "_sleep", no_wait)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert compressor.calls == [
+        ids(FOUR_TURNS),
+        ["u1", "a1", "u2", "a2"],
+        ["u3", "a3", "u4", "a4"],
+        ["u3", "a3", "u4", "a4"],
+        ["u3", "a3", "u4", "a4"],
+    ]
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+    done = stand.storage.marker(archive(1), ".done")
+    assert done["completed_memory_steps"]["long_term"] == sorted(ids(FOUR_TURNS))

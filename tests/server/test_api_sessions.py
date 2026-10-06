@@ -433,6 +433,77 @@ async def test_get_session_context_stops_at_newest_failed_archive(
     assert [message.content for message in raw] == ["Failed archive message"]
 
 
+async def test_get_session_tells_how_many_archives_wait_for_a_summary(
+    client: httpx.AsyncClient, service
+):
+    """piqnyx (PLAN-gorizont 3е): the plugin pours again only when nought waits.
+
+    An archive whose summary is not written yet is replayed raw and counted, in
+    the session's details and in the context's stats; once its summary stands
+    (the mark `.summary.done` beside a readable overview) the context takes the
+    overview, leaves the raw messages out, and the count is nought.
+    """
+    create_resp = await client.post("/api/v1/sessions", json={})
+    session_id = create_resp.json()["result"]["session_id"]
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    session = service.sessions.session(ctx, session_id)
+    await session.load()
+    archived = [
+        Message(
+            id="archived-user",
+            role="user",
+            parts=[TextPart("Archived question")],
+            peer_id=DEFAULT_USER.user_id,
+        ),
+        Message(
+            id="archived-assistant",
+            role="assistant",
+            parts=[TextPart("Archived answer")],
+            peer_id="assistant-default",
+        ),
+    ]
+    archive_uri = f"{session.uri}/history/archive_001"
+    await session._viking_fs.write_file(
+        uri=f"{archive_uri}/messages.jsonl",
+        content="\n".join(msg.to_jsonl() for msg in archived) + "\n",
+        ctx=session.ctx,
+    )
+    await client.post(
+        f"/api/v1/sessions/{session_id}/messages",
+        json=_message_request("user", content="Current live message"),
+    )
+
+    waiting = await client.get(f"/api/v1/sessions/{session_id}")
+    assert waiting.status_code == 200
+    assert waiting.json()["result"]["unsummarized_archives"] == 1
+    context = await client.get(f"/api/v1/sessions/{session_id}/context")
+    assert context.status_code == 200
+    assert context.json()["result"]["stats"]["unsummarizedArchives"] == 1
+    assert [m["parts"][0]["text"] for m in context.json()["result"]["messages"]] == [
+        "Archived question",
+        "Archived answer",
+        "Current live message",
+    ]
+
+    await session._viking_fs.write_file(
+        uri=f"{archive_uri}/.overview.md", content="# WM after the archive", ctx=session.ctx
+    )
+    await session._viking_fs.write_file(
+        uri=f"{archive_uri}/.summary.done",
+        content=json.dumps({"written_at": "2026-10-06T20:00:00Z"}),
+        ctx=session.ctx,
+    )
+
+    standing = await client.get(f"/api/v1/sessions/{session_id}")
+    assert standing.json()["result"]["unsummarized_archives"] == 0
+    context = await client.get(f"/api/v1/sessions/{session_id}/context")
+    body = context.json()["result"]
+    assert body["stats"]["unsummarizedArchives"] == 0
+    assert body["latest_archive_overview"] == "# WM after the archive"
+    assert [m["parts"][0]["text"] for m in body["messages"]] == ["Current live message"]
+
+
 async def test_add_message(client: httpx.AsyncClient):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]

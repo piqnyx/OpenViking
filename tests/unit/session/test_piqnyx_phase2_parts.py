@@ -143,17 +143,22 @@ STORM = (
 class _Compressor:
     """Long-term extraction the door takes only up to `limit` messages at once."""
 
-    def __init__(self, limit=8, heavy=None, fail_on=None, storms_on=None, storms=0):
+    def __init__(self, limit=8, heavy=None, fail_on=None, storms_on=None, storms=0, hold=None):
         self.limit = limit
         self.heavy = heavy or (lambda part: len(part) > self.limit)
         self.fail_on = fail_on
         self.storms_on = storms_on
         self.storms = storms
+        # An event the extraction waits for before it answers: the summary is
+        # written while the extraction is still at work.
+        self.hold = hold
         self.calls = []
 
     async def extract_long_term_memories(self, messages, **kwargs):
         part = ids(messages)
         self.calls.append(part)
+        if self.hold is not None:
+            await self.hold.wait()
         if self.fail_on is not None and self.fail_on(part):
             raise ValueError("broken json from the model")
         if self.storms and self.storms_on is not None and self.storms_on(part):
@@ -463,3 +468,225 @@ async def test_the_task_tells_what_was_done_and_what_failed(monkeypatch):
     assert task.error.startswith("working memory written; ")
     assert "long_term_memory_extraction: 4 of 8 messages done" in task.error
     assert "broken json" in task.error
+
+
+# PLAN-gorizont 3е (Вит, 06.10): the summary stands as soon as it is written. An
+# archive whose extraction is still at work, or failed, carries the mark
+# `.summary.done`; the context takes its overview and leaves its raw messages out,
+# the way it does for a closed archive. An archive without the mark is replayed raw
+# and counted, so the plugin knows not to pour again until the count is nought.
+
+SUMMARY_MARK = ".summary.done"
+
+
+def _stages_of(monkeypatch, stand):
+    stages = []
+    real_update_stage = stand.tracker.update_stage
+
+    async def remember(task_id, stage, **kwargs):
+        stages.append(stage)
+        await real_update_stage(task_id, stage, **kwargs)
+
+    monkeypatch.setattr(stand.tracker, "update_stage", remember)
+    return stages
+
+
+async def _context_of(stand):
+    return await stand.session._collect_session_context_components()
+
+
+@pytest.mark.asyncio
+async def test_a_written_summary_stands_in_the_context_while_extraction_still_runs(monkeypatch):
+    hold = asyncio.Event()
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8, hold=hold))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.session._messages = [user(5)]
+    stages = _stages_of(monkeypatch, stand)
+
+    run = asyncio.create_task(stand.run(1, FOUR_TURNS, "t1"))
+    for _ in range(1000):
+        if stand.storage.marker(archive(1), SUMMARY_MARK):
+            break
+        await asyncio.sleep(0)
+    else:
+        hold.set()
+        await run
+        pytest.fail("the summary mark never appeared while the extraction was held")
+
+    mark = stand.storage.marker(archive(1), SUMMARY_MARK)
+    assert isinstance(mark["written_at"], str) and mark["written_at"]
+    assert stand.storage.marker(archive(1), ".done") is None
+    assert "working memory written" in stages
+    context = await _context_of(stand)
+    assert context["latest_archive"]["overview"] == "# WM after a4"
+    assert ids(context["messages"]) == ["u5"]
+    assert context["failed_archives"] == 0
+    assert context["unsummarized_archives"] == 0
+    assert await stand.session.unsummarized_archives() == 0
+
+    hold.set()
+    await run
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+    assert stand.storage.marker(archive(1), ".done") is not None
+    after = await _context_of(stand)
+    assert after["latest_archive"]["overview"] == "# WM after a4"
+    assert ids(after["messages"]) == ["u5"]
+    assert after["unsummarized_archives"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_summary_mark_is_written_even_when_extraction_fails(monkeypatch):
+    compressor = _Compressor(limit=4, fail_on=lambda part: part == ["u3", "a3", "u4", "a4"])
+    stand = _Stand(monkeypatch, compressor=compressor, summary_limit=4)
+    stand.archive_with(1, FOUR_TURNS)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert (await stand.task("t1")).status == TaskStatus.FAILED
+    assert stand.storage.marker(archive(1), SUMMARY_MARK) is not None
+    assert stand.storage.marker(archive(1), ".failed.json")["summary_complete"] is True
+    assert await stand.session.unsummarized_archives() == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_summary_leaves_no_mark(monkeypatch):
+    stand = _Stand(
+        monkeypatch,
+        compressor=_Compressor(limit=8),
+        summary_heavy=lambda messages: "u3" in ids(messages),
+    )
+    stand.archive_with(1, FOUR_TURNS)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert (await stand.task("t1")).status == TaskStatus.FAILED
+    assert stand.storage.marker(archive(1), SUMMARY_MARK) is None
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_that_finds_the_summary_already_written_marks_it(monkeypatch):
+    # The archive was summarized by the server of image .2, which left the part
+    # marks and the overview but knew no summary mark; the task comes round again.
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.storage.files[f"{archive(1)}/.overview.md"] = "# WM after a4"
+    stand.storage.files[f"{archive(1)}/.meta.json"] = json.dumps(
+        {"completed_memory_steps": {"archive_summary": sorted(ids(FOUR_TURNS))}}
+    )
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+    assert stand.summaries == []
+    assert stand.storage.marker(archive(1), SUMMARY_MARK) is not None
+    assert stand.storage.marker(archive(1), ".done") is not None
+
+
+@pytest.mark.asyncio
+async def test_an_archive_without_a_summary_yet_is_replayed_raw_and_counted(monkeypatch):
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.session._messages = [user(5)]
+
+    context = await _context_of(stand)
+    assert context["latest_archive"] is None
+    assert ids(context["messages"]) == ids(FOUR_TURNS) + ["u5"]
+    assert context["unsummarized_archives"] == 1
+    assert await stand.session.unsummarized_archives() == 1
+    whole = await stand.session.get_session_context(token_budget=1_000_000)
+    assert whole["stats"]["unsummarizedArchives"] == 1
+    assert [m["id"] for m in whole["messages"]] == ids(FOUR_TURNS) + ["u5"]
+
+
+@pytest.mark.asyncio
+async def test_a_newer_archive_without_a_summary_rides_on_the_older_summarized_one(monkeypatch):
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.storage.files[f"{archive(1)}/.overview.md"] = "# WM one"
+    stand.storage.files[f"{archive(1)}/{SUMMARY_MARK}"] = json.dumps({"written_at": "x"})
+    stand.archive_with(2, [user(5), assistant(5)])
+    stand.session._messages = [user(6)]
+
+    context = await _context_of(stand)
+    assert context["latest_archive"]["overview"] == "# WM one"
+    assert context["latest_archive"]["archive_id"] == "archive_001"
+    assert ids(context["messages"]) == ["u5", "a5", "u6"]
+    assert context["failed_archives"] == 0
+    assert context["unsummarized_archives"] == 1
+    assert await stand.session.unsummarized_archives() == 1
+    whole = await stand.session.get_session_context(token_budget=1_000_000)
+    assert whole["latest_archive_overview"] == "# WM one"
+    assert whole["stats"]["unsummarizedArchives"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_summary_mark_without_a_readable_overview_hides_nothing(monkeypatch):
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.storage.files[f"{archive(1)}/{SUMMARY_MARK}"] = json.dumps({"written_at": "x"})
+    stand.session._messages = [user(5)]
+
+    context = await _context_of(stand)
+    assert context["latest_archive"] is None
+    assert ids(context["messages"]) == ids(FOUR_TURNS) + ["u5"]
+    assert context["unsummarized_archives"] == 1
+    assert await stand.session.unsummarized_archives() == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_archive_with_the_mark_alone_feeds_the_context(monkeypatch):
+    # Written by a server that knows the mark but a failure marker without the flag.
+    stand = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    stand.archive_with(1, FOUR_TURNS)
+    stand.storage.files[f"{archive(1)}/.overview.md"] = "# WM one"
+    stand.storage.files[f"{archive(1)}/{SUMMARY_MARK}"] = json.dumps({"written_at": "x"})
+    stand.storage.files[f"{archive(1)}/.failed.json"] = json.dumps(
+        {"stage": "memory_extraction", "error": "broken json"}
+    )
+    stand.session._messages = [user(5)]
+
+    context = await _context_of(stand)
+    assert context["latest_archive"]["overview"] == "# WM one"
+    assert ids(context["messages"]) == ["u5"]
+    assert context["failed_archives"] == 1
+    assert context["unsummarized_archives"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_checkpoints_of_a_standing_summary_are_inserted(monkeypatch):
+    def checkpoints_for(anchor):
+        return json.dumps(
+            {
+                "checkpoints": [
+                    {
+                        "turn_anchor_message_id": anchor,
+                        "source_message_ids": ["u1", "a1"],
+                        "abstract": f"what was said before {anchor}",
+                        "checkpoint_version": 2,
+                    }
+                ]
+            }
+        )
+
+    # The summary stands with the extraction still at work ...
+    pending = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    pending.archive_with(1, FOUR_TURNS)
+    pending.storage.files[f"{archive(1)}/.overview.md"] = "# WM one"
+    pending.storage.files[f"{archive(1)}/{SUMMARY_MARK}"] = json.dumps({"written_at": "x"})
+    pending.storage.files[f"{archive(1)}/.meta.json"] = checkpoints_for("u5")
+    pending.session._messages = [user(5), assistant(5)]
+    context = await _context_of(pending)
+    assert ids(context["messages"]) == ["u5", "checkpoint_archive_001_u5", "a5"]
+    assert context["messages"][1].parts[0].abstract == "what was said before u5"
+
+    # ... and with the extraction failed after it.
+    failed = _Stand(monkeypatch, compressor=_Compressor(limit=8))
+    failed.archive_with(1, FOUR_TURNS)
+    failed.storage.files[f"{archive(1)}/.overview.md"] = "# WM one"
+    failed.storage.files[f"{archive(1)}/.meta.json"] = checkpoints_for("u5")
+    failed.storage.files[f"{archive(1)}/.failed.json"] = json.dumps(
+        {"stage": "memory_extraction", "error": "broken json", "summary_complete": True}
+    )
+    failed.session._messages = [user(5), assistant(5)]
+    context = await _context_of(failed)
+    assert ids(context["messages"]) == ["u5", "checkpoint_archive_001_u5", "a5"]

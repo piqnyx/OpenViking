@@ -249,6 +249,9 @@ async def get_session(
     result["uri"] = session.uri
     result["user"] = session.user.to_dict()
     result["pending_tokens"] = int(session.meta.pending_tokens or 0)
+    # piqnyx (PLAN-gorizont 3е): archives replayed raw because their summary is
+    # not written yet; the plugin pours the session again only at nought.
+    result["unsummarized_archives"] = await session.unsummarized_archives()
     return Response(status="ok", result=result)
 
 

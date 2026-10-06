@@ -1,4 +1,5 @@
 openviking/models/vlm/backends/openai_vlm.py
+openviking/server/routers/sessions.py
 openviking/session/piqnyx_parts.py
 openviking/session/session.py
 openviking/utils/piqnyx_persistence.py

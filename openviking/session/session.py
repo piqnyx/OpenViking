@@ -10,7 +10,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
 
 from openviking.core.namespace import canonical_session_uri
@@ -87,6 +87,9 @@ _MEMORY_STEP_WORDS = {
     "long_term": "long_term_memory_extraction",
     "execution": "execution_memory_extraction",
 }
+# piqnyx (PLAN-gorizont 3е): the mark beside `.done` and `.failed.json` that says the
+# archive's working memory is written whole, while the extraction may still be at work.
+_SUMMARY_MARK = ".summary.done"
 
 
 def _phase2_failure_words(
@@ -2356,6 +2359,7 @@ class Session:
                         if not summary_messages:
                             logger.info("Working Memory summary already written for every message")
                             summary_complete = True
+                            await self._write_summary_mark(archive_uri)
                             return
 
                         async def _summarize(part: List[Message]) -> None:
@@ -2431,6 +2435,7 @@ class Session:
                             operation="archive_summary",
                         )
                         summary_complete = True
+                        await self._write_summary_mark(archive_uri)
                         await _tell_stage("working memory written")
 
                     async def _run_retryable_phase2_step(
@@ -2928,6 +2933,23 @@ class Session:
             ctx=self.ctx,
         )
 
+    async def _write_summary_mark(self, archive_uri: str) -> None:
+        """Mark that this archive's working memory is written whole (PLAN-gorizont 3е).
+
+        From this moment the archive's summary stands, whatever the extraction
+        does after it: the context takes the overview and leaves the raw
+        messages out, as for a closed archive. Written again on a rerun that
+        finds the summary already done -- the archives of image .2 have the part
+        marks and the overview but no mark.
+        """
+        if not self._viking_fs:
+            return
+        await self._viking_fs.write_file(
+            uri=f"{archive_uri}/{_SUMMARY_MARK}",
+            content=json.dumps({"written_at": get_current_timestamp()}, ensure_ascii=False),
+            ctx=self.ctx,
+        )
+
     async def _write_failed_marker(
         self,
         archive_uri: str,
@@ -3023,6 +3045,9 @@ class Session:
                 "includedArchives": included_archives,
                 "droppedArchives": dropped_archives,
                 "failedArchives": context["failed_archives"],
+                # piqnyx (PLAN-gorizont 3е): archives replayed raw because their
+                # summary is not written yet; the plugin pours again only at nought.
+                "unsummarizedArchives": context["unsummarized_archives"],
                 "activeTokens": message_tokens,
                 "archiveTokens": archive_tokens,
             },
@@ -3082,7 +3107,12 @@ class Session:
         - newest terminal is ``completed``: inject that archive's overview when
           readable, plus raw messages from the newer non-terminal archives;
         - newest terminal is ``failed``: no overview, and only the newer
-          non-terminal archives contribute raw messages;
+          non-terminal archives contribute raw messages; unless its working
+          memory was written whole (PLAN-gorizont 3г), then its overview stands;
+        - a non-terminal archive carrying the summary mark beside a readable
+          overview (PLAN-gorizont 3е) stops the walk like a completed one: its
+          overview is injected, its raw messages are left out, and only the
+          newer archives without the mark contribute raw messages;
         - no terminal at all: no overview, every archive is still non-terminal
           so all of their raw messages are returned.
 
@@ -3095,23 +3125,23 @@ class Session:
         the full ``_scan_archive_states()`` scan. Public
         ``pre_archive_abstracts`` stay empty; abstracts are not read.
         """
-        archive_refs = await self._list_archive_refs()
-        newer_pending: List[Dict[str, Any]] = []
-        terminal: Optional[Dict[str, Any]] = None
-        terminal_state = ""
-
-        for archive in archive_refs:  # newest → oldest
-            state = await self._archive_terminal_state(archive["archive_uri"])
-            if state == "pending":
-                newer_pending.append(archive)
-                continue
-            terminal = archive
-            terminal_state = state
-            break
+        archive_refs, newer_pending, terminal, terminal_state = await self._scan_to_the_summary()
 
         latest_archive = None
         failed_archives = 0
-        if terminal is not None and terminal_state == "completed":
+        if terminal is not None and terminal_state == "summarized":
+            # piqnyx (PLAN-gorizont 3е): the summary is written whole and the
+            # extraction still at work -- the summary stands, as for a closed archive.
+            overview = (await self._read_archive_overview(terminal["archive_uri"])).strip()
+            latest_archive = {
+                "archive_id": terminal["archive_id"],
+                "archive_uri": terminal["archive_uri"],
+                "overview": overview,
+                "overview_tokens": await self._read_archive_overview_tokens(
+                    terminal["archive_uri"], overview
+                ),
+            }
+        elif terminal is not None and terminal_state == "completed":
             overview = (await self._read_archive_overview(terminal["archive_uri"])).strip()
             if overview:
                 latest_archive = {
@@ -3145,7 +3175,11 @@ class Session:
                     marker = parsed_marker
             except Exception:
                 marker = {}
-            if marker.get("summary_complete") is True:
+            # The flag was all the server of image .2 wrote; the mark came with 3е.
+            summary_stands = marker.get("summary_complete") is True or (
+                await self._archive_file_exists(terminal["archive_uri"], _SUMMARY_MARK)
+            )
+            if summary_stands:
                 overview = (await self._read_archive_overview(terminal["archive_uri"])).strip()
                 if overview:
                     latest_archive = {
@@ -3171,9 +3205,11 @@ class Session:
                 )
 
         merged_messages = self._stable_deduplicate_messages(archive_messages + list(self._messages))
+        # The checkpoints are written with the summary (PLAN-gorizont 3е): they
+        # belong to any archive whose summary stands, not only to a closed one.
         merged_messages = await self._insert_terminal_checkpoints(
             merged_messages,
-            terminal if terminal_state == "completed" else None,
+            terminal if terminal_state == "completed" or latest_archive is not None else None,
         )
 
         return {
@@ -3183,8 +3219,56 @@ class Session:
             # per-archive marker scan this read path exists to avoid.
             "total_archives": len(archive_refs),
             "failed_archives": failed_archives,
+            "unsummarized_archives": len(newer_pending),
             "messages": merged_messages,
         }
+
+    async def _scan_to_the_summary(
+        self,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+        """Walk the archives newest → oldest to the first whose summary stands.
+
+        Returns every archive ref, the newer ones still waiting for a summary
+        (newest first; their raw messages go into the context), the archive the
+        walk stopped at, and its state: ``completed``, ``failed``, or
+        ``summarized`` -- no terminal marker yet, but the summary mark beside a
+        readable overview (PLAN-gorizont 3е). A mark beside no readable overview
+        hides nothing: that archive waits like one without a mark.
+        """
+        archive_refs = await self._list_archive_refs()
+        newer_pending: List[Dict[str, Any]] = []
+        terminal: Optional[Dict[str, Any]] = None
+        terminal_state = ""
+
+        for archive in archive_refs:  # newest → oldest
+            state = await self._archive_terminal_state(archive["archive_uri"])
+            if state == "pending":
+                if await self._archive_file_exists(archive["archive_uri"], _SUMMARY_MARK):
+                    if (await self._read_archive_overview(archive["archive_uri"])).strip():
+                        terminal = archive
+                        terminal_state = "summarized"
+                        break
+                    logger.warning(
+                        "Archive marked as summarized has no readable overview, "
+                        "its messages stay in the context: %s",
+                        archive["archive_uri"],
+                    )
+                newer_pending.append(archive)
+                continue
+            terminal = archive
+            terminal_state = state
+            break
+
+        return archive_refs, newer_pending, terminal, terminal_state
+
+    async def unsummarized_archives(self) -> int:
+        """How many archives are replayed raw because their summary is not written yet.
+
+        The plugin pours the session again only when this is nought (PLAN-gorizont
+        3е); told in the session's details and in the context's stats.
+        """
+        _refs, newer_pending, _terminal, _state = await self._scan_to_the_summary()
+        return len(newer_pending)
 
     async def _archive_terminal_state(self, archive_uri: str) -> str:
         """Return ``completed``, ``failed``, or ``pending`` for one archive."""

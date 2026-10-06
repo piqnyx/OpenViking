@@ -1,2 +1,5 @@
+openviking/models/vlm/backends/openai_vlm.py
+openviking/session/piqnyx_parts.py
 openviking/session/session.py
 openviking/utils/piqnyx_persistence.py
+openviking/utils/piqnyx_price.py

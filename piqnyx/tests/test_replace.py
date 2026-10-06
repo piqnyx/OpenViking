@@ -447,3 +447,104 @@ def test_the_replacement_leaves_the_fork_as_it_was(server):
     assert server.replace("--do").returncode == 0
 
     assert server.git("status", "--porcelain", "--untracked-files=all") == ""
+
+
+# ------------------------------------------- an earlier image of ours is there
+# PLAN-gorizont 3д: the second build takes the place of the first. The file then
+# names an image of ours; the copy of the file before this replacement is kept
+# and the older copy is put aside, numbered; the way back leads to the first
+# image of ours, not to theirs.
+
+OUR_IMAGE_BEFORE = f"{FACTS['NAME']}:0.0.0-test.0"
+ON_OURS = THEIRS.replace(
+    f"    image: {THEIR_IMAGE}\n", f"    image: {OUR_IMAGE_BEFORE}\n    pull_policy: never\n"
+)
+
+
+@pytest.fixture
+def server_on_ours(server):
+    """The server after the first replacement: on an image of ours, theirs kept beside."""
+    server.scenario["images"][OUR_IMAGE_BEFORE] = {
+        "side": "new",
+        "config": server.images.new_config,
+        "id": "sha256:p",
+        "version_inside": "0.0.0-test.0",
+    }
+    server.compose.write_text(ON_OURS)
+    server.kept().write_text(THEIRS)
+    server.runs({"image": OUR_IMAGE_BEFORE, "id": "sha256:p", "looked": 1})
+    return server
+
+
+def test_without_a_key_on_an_earlier_image_of_ours_it_shows_the_change(server_on_ours):
+    done = server_on_ours.replace()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"- image: {OUR_IMAGE_BEFORE}" in done.stdout
+    assert f"+ image: {OUR_IMAGE}" in done.stdout
+    assert "ничего не тронуто" in last(done)
+    assert server_on_ours.compose.read_text() == ON_OURS
+    assert server_on_ours.story() == []
+
+
+def test_an_earlier_image_of_ours_is_replaced_and_both_copies_are_kept(server_on_ours):
+    done = server_on_ours.replace("--do")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert server_on_ours.story() == [("down", OUR_IMAGE), ("up", OUR_IMAGE)]
+    assert server_on_ours.running()["image"] == OUR_IMAGE
+    assert server_on_ours.compose.read_text() == OURS
+    assert server_on_ours.kept().read_text() == ON_OURS
+    assert (server_on_ours.home / f"{KEPT}.1").read_text() == THEIRS
+    assert "ИТОГ ЗАМЕНЫ" in last(done) and OUR_IMAGE in last(done)
+
+
+def test_the_way_back_from_the_second_replacement_leads_to_the_first_image_of_ours(server_on_ours):
+    assert server_on_ours.replace("--do").returncode == 0
+
+    done = server_on_ours.replace("--back")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert server_on_ours.running()["image"] == OUR_IMAGE_BEFORE
+    assert server_on_ours.compose.read_text() == ON_OURS
+    assert server_on_ours.story()[-2:] == [("down", OUR_IMAGE_BEFORE), ("up", OUR_IMAGE_BEFORE)]
+
+
+def test_a_second_replacement_that_does_not_rise_goes_back_to_the_first_image_of_ours(
+    server_on_ours,
+):
+    server_on_ours.scenario["states"] = {OUR_IMAGE: NEVER_HEALTHY}
+
+    done = server_on_ours.replace("--do")
+
+    assert done.returncode != 0
+    assert server_on_ours.compose.read_text() == ON_OURS
+    assert server_on_ours.running()["image"] == OUR_IMAGE_BEFORE
+    assert server_on_ours.story() == [
+        ("down", OUR_IMAGE),
+        ("up", OUR_IMAGE),
+        ("down", OUR_IMAGE_BEFORE),
+        ("up", OUR_IMAGE_BEFORE),
+    ]
+    assert server_on_ours.kept().read_text() == ON_OURS
+    assert (server_on_ours.home / f"{KEPT}.1").read_text() == THEIRS
+
+
+def test_a_third_replacement_numbers_the_next_copy(server_on_ours):
+    (server_on_ours.home / f"{KEPT}.1").write_text("an older copy\n")
+
+    assert server_on_ours.replace("--do").returncode == 0
+
+    assert (server_on_ours.home / f"{KEPT}.1").read_text() == "an older copy\n"
+    assert (server_on_ours.home / f"{KEPT}.2").read_text() == THEIRS
+    assert server_on_ours.kept().read_text() == ON_OURS
+
+
+def test_a_file_of_theirs_with_another_copy_kept_is_still_refused(server):
+    # The first replacement: a stray copy that is not this file stops it, as before.
+    server.kept().write_text(THEIRS.replace("30s", "31s"))
+
+    done = server.replace("--do")
+
+    assert done.returncode != 0
+    assert server.story() == []

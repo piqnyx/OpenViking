@@ -20,6 +20,11 @@ except ImportError:
     openai = None
 
 from openviking.utils.model_retry import retry_async, retry_sync
+from openviking.utils.piqnyx_price import (
+    door_refused_as_too_heavy,
+    priced_or_too_heavy,
+    too_heavy_from_the_door,
+)
 
 from ..base import ToolCall, VLMBase, VLMResponse
 from ..registry import DEFAULT_AZURE_API_VERSION
@@ -334,10 +339,20 @@ class OpenAIVLM(VLMBase):
         effective_thinking = self.thinking if thinking is None else thinking
         client = self.get_async_client()
         kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, effective_thinking)
+        # piqnyx (PLAN-gorizont 3б): the proxy's price handle sees the very body about
+        # to go; a body above the door's ceiling never leaves. The verdict is raised,
+        # not retried, and the step cuts its part by turns.
+        await priced_or_too_heavy(kwargs)
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
-            response = await client.chat.completions.create(**kwargs)
+            try:
+                response = await client.chat.completions.create(**kwargs)
+            except Exception as error:
+                # The door's own overflow refusal is the same verdict, arriving late.
+                if door_refused_as_too_heavy(error):
+                    raise too_heavy_from_the_door(error) from error
+                raise
             elapsed = time.perf_counter() - t0
             if tools is not None:
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)

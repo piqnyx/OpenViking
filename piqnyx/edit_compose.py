@@ -4,7 +4,8 @@
 """Changes the image of a service in a compose file (PIQNYX.md, stage 2.6).
 
     edit_compose.py --file docker-compose.yml --service openviking \\
-        --image piqnyx/openviking:0.4.12-piqnyx.1 --was-of ghcr.io/volcengine/openviking \\
+        --image piqnyx/openviking:0.4.12-piqnyx.2 --was-of ghcr.io/volcengine/openviking \\
+        --was-of piqnyx/openviking \\
         --out NEW.yml
     edit_compose.py --file docker-compose.yml --service openviking --data-folder
     edit_compose.py --file docker-compose.yml --service openviking --image-now
@@ -26,7 +27,7 @@ import difflib
 import re
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 POLICY = "never"
 KEY = re.compile(r"^([ \t]*)([A-Za-z_][\w.-]*):(.*)$")
@@ -133,12 +134,18 @@ def image_now(text: str, *, service: str) -> str:
     return _value(_image(text.splitlines(keepends=True), service)[1])[0]
 
 
-def edit(text: str, *, service: str, image: str, was_of: str) -> Done:
+def edit(text: str, *, service: str, image: str, was_of: Union[str, Sequence[str]]) -> Done:
+    # The names the file may carry before the edit: the image we built on, and --
+    # since the second build (PLAN-gorizont 3д) -- an earlier image of ours.
+    names = [was_of] if isinstance(was_of, str) else list(was_of)
     lines = text.splitlines(keepends=True)
     at, rest, keys = _image(lines, service)
     was, tail = _value(rest)
-    if was != image and was != was_of and not was.startswith((was_of + ":", was_of + "@")):
-        raise Refused(f"образ в файле не тот, что ждали: {was} (ждали {was_of} или {image})")
+    expected = any(was == name or was.startswith((name + ":", name + "@")) for name in names)
+    if was != image and not expected:
+        raise Refused(
+            f"образ в файле не тот, что ждали: {was} (ждали {' или '.join(names)} или {image})"
+        )
 
     indent = _indent(lines[at])
     policies = [(n, rest) for n, key, rest in keys if key == "pull_policy"]
@@ -216,7 +223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--file", required=True)
     parser.add_argument("--service", required=True)
     parser.add_argument("--image")
-    parser.add_argument("--was-of")
+    parser.add_argument("--was-of", action="append")
     parser.add_argument("--out")
     parser.add_argument("--data-folder", action="store_true")
     parser.add_argument("--image-now", action="store_true")

@@ -83,6 +83,31 @@ _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 _MEMORY_STEP_NAMES = ("long_term", "execution", "archive_summary")
 
 
+_MEMORY_STEP_WORDS = {
+    "long_term": "long_term_memory_extraction",
+    "execution": "execution_memory_extraction",
+}
+
+
+def _phase2_failure_words(
+    summary_complete: bool,
+    completed_memory_steps: Dict[str, set[str]],
+    messages: List[Message],
+    error: BaseException,
+) -> str:
+    """What Phase 2 managed before it failed, then the failure itself (PLAN-gorizont 3г)."""
+    words: List[str] = []
+    if summary_complete:
+        words.append("working memory written")
+    ids = {message.id for message in messages}
+    for step, name in _MEMORY_STEP_WORDS.items():
+        done = len(completed_memory_steps.get(step, set()) & ids)
+        if done:
+            words.append(f"{name}: {done} of {len(ids)} messages done")
+    words.append(str(error))
+    return "; ".join(words)
+
+
 def _merge_step_results(results: List[Any]) -> Any:
     """The results of a step's parts as one: dicts by their lists, lists end to end."""
     if any(isinstance(result, dict) for result in results):
@@ -2245,6 +2270,9 @@ class Session:
         active_count_updated = 0
         memory_diff_uri: Optional[str] = None
         completed_memory_steps: Dict[str, set[str]] = {}
+        # piqnyx (PLAN-gorizont 3г): a written summary is a summary, whatever the
+        # extraction does after it. Marked here, written into the markers below.
+        summary_complete = False
         telemetry = OperationTelemetry(operation="session_commit_phase2", enabled=True)
         archive_index = self._archive_index_from_uri(archive_uri)
 
@@ -2301,6 +2329,7 @@ class Session:
                     )
 
                     async def _run_archive_summary() -> None:
+                        nonlocal summary_complete
                         if not working_memory_enabled:
                             logger.info(
                                 "Working Memory summary skipped "
@@ -2326,6 +2355,7 @@ class Session:
                                 current_overview = written
                         if not summary_messages:
                             logger.info("Working Memory summary already written for every message")
+                            summary_complete = True
                             return
 
                         async def _summarize(part: List[Message]) -> None:
@@ -2400,6 +2430,8 @@ class Session:
                             on_split=_tell_of_the_cut("archive_summary"),
                             operation="archive_summary",
                         )
+                        summary_complete = True
+                        await _tell_stage("working memory written")
 
                     async def _run_retryable_phase2_step(
                         operation_name: str,
@@ -2459,18 +2491,23 @@ class Session:
                                 logger.warning("Could not update the task's stage: %s", trouble)
                         return result
 
+                    async def _tell_stage(words: str) -> None:
+                        try:
+                            await tracker.update_stage(
+                                task_id,
+                                words,
+                                account_id=self.ctx.account_id,
+                                user_id=self.ctx.user.user_id,
+                            )
+                        except Exception as trouble:
+                            logger.warning("Could not update the task's stage: %s", trouble)
+
                     def _tell_of_the_cut(operation_name: str):
                         async def tell(part: List[Message], heavy: Any) -> None:
-                            try:
-                                await tracker.update_stage(
-                                    task_id,
-                                    f"cutting {operation_name}: {len(part)} messages are too heavy "
-                                    f"for the door ({heavy}); halves by turns",
-                                    account_id=self.ctx.account_id,
-                                    user_id=self.ctx.user.user_id,
-                                )
-                            except Exception as trouble:
-                                logger.warning("Could not update the task's stage: %s", trouble)
+                            await _tell_stage(
+                                f"cutting {operation_name}: {len(part)} messages are too heavy "
+                                f"for the door ({heavy}); halves by turns"
+                            )
 
                         return tell
 
@@ -2484,7 +2521,10 @@ class Session:
                         # done is marked before the next one runs, so a process
                         # restart, a sibling's failure or a later archive's replay
                         # resumes without applying this memory step twice.
+                        done_count = 0
+
                         async def _mark(part: List[Message], _result: Any) -> None:
+                            nonlocal done_count
                             completed_memory_steps.setdefault(step, set()).update(
                                 message.id for message in part
                             )
@@ -2497,6 +2537,11 @@ class Session:
                                         )
                                     )
                                 },
+                            )
+                            done_count += len(part)
+                            await _tell_stage(
+                                f"{operation_name}: {done_count} of {len(step_messages)} "
+                                f"messages done"
                             )
 
                         results = await run_in_parts(
@@ -2834,6 +2879,7 @@ class Session:
                 )
             raise
         except Exception as e:
+            words = _phase2_failure_words(summary_complete, completed_memory_steps, messages, e)
             await self._write_failed_marker(
                 archive_uri,
                 stage="memory_extraction",
@@ -2841,11 +2887,12 @@ class Session:
                 completed_memory_steps=self._serialize_completed_memory_steps(
                     completed_memory_steps
                 ),
+                summary_complete=summary_complete,
             )
             await tracker.fail(
-                task_id, str(e), account_id=self.ctx.account_id, user_id=self.ctx.user.user_id
+                task_id, words, account_id=self.ctx.account_id, user_id=self.ctx.user.user_id
             )
-            logger.exception(f"Memory extraction failed for session {self.session_id}")
+            logger.exception(f"Memory extraction failed for session {self.session_id}: {words}")
 
     async def _write_done_file(
         self,
@@ -2890,6 +2937,7 @@ class Session:
         skipped: bool = True,
         completed_memory_steps: Optional[Dict[str, List[str]]] = None,
         lease_ref: Optional[Any] = None,
+        summary_complete: Optional[bool] = None,
     ) -> None:
         """Persist a terminal failure marker for the archive."""
         if not self._viking_fs:
@@ -2901,6 +2949,10 @@ class Session:
             "skipped": skipped,
             "completed_memory_steps": dict(completed_memory_steps or {}),
         }
+        if summary_complete is not None:
+            # piqnyx (PLAN-gorizont 3г): the working memory of this archive is whole
+            # although a later step failed; readers may take its overview.
+            payload["summary_complete"] = bool(summary_complete)
         if blocked_by:
             payload["blocked_by"] = blocked_by
         await self._viking_fs.write_file(
@@ -3081,6 +3133,29 @@ class Session:
                 failed_archives = 1
         elif terminal is not None:
             failed_archives = 1
+            # piqnyx (PLAN-gorizont 3г): the newest terminal failed after its working
+            # memory was written whole -- the summary stands, the extraction waits.
+            marker: Dict[str, Any] = {}
+            try:
+                raw_marker = await self._viking_fs.read_file(
+                    f"{terminal['archive_uri']}/.failed.json", ctx=self.ctx
+                )
+                parsed_marker = json.loads(raw_marker or "{}")
+                if isinstance(parsed_marker, dict):
+                    marker = parsed_marker
+            except Exception:
+                marker = {}
+            if marker.get("summary_complete") is True:
+                overview = (await self._read_archive_overview(terminal["archive_uri"])).strip()
+                if overview:
+                    latest_archive = {
+                        "archive_id": terminal["archive_id"],
+                        "archive_uri": terminal["archive_uri"],
+                        "overview": overview,
+                        "overview_tokens": await self._read_archive_overview_tokens(
+                            terminal["archive_uri"], overview
+                        ),
+                    }
 
         archive_messages: List[Message] = []
         # newer_pending was collected newest-first; restore chronological order.
@@ -3238,12 +3313,18 @@ class Session:
                         failed = parsed_failed
                 except Exception as exc:
                     logger.warning("Unreadable archive failed marker %s: %s", failed_uri, exc)
+            # piqnyx (PLAN-gorizont 3г): a failed archive whose working memory was
+            # written whole still has a summary worth reading.
+            overview = ""
+            if failed_exists and failed.get("summary_complete") is True:
+                overview = await self._read_archive_overview(archive["archive_uri"])
             states.append(
                 ArchiveState(
                     archive_id=archive["archive_id"],
                     archive_uri=archive["archive_uri"],
                     index=archive["index"],
                     state="failed" if failed_exists else "pending",
+                    overview=overview,
                     failed=failed,
                 )
             )
@@ -3325,8 +3406,14 @@ class Session:
         self,
         exclude_archive_uri: Optional[str] = None,
         before_archive_index: Optional[int] = None,
+        *,
+        with_summary_of_failed: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return completed archive refs sorted by archive index descending."""
+        """Return completed archive refs sorted by archive index descending.
+
+        With ``with_summary_of_failed`` a failed archive whose working memory was
+        written whole counts too (PLAN-gorizont 3г): its summary is a summary.
+        """
         completed: List[Dict[str, Any]] = []
         exclude = exclude_archive_uri.rstrip("/") if exclude_archive_uri else None
 
@@ -3335,7 +3422,10 @@ class Session:
                 continue
             if before_archive_index is not None and state.index >= before_archive_index:
                 continue
-            if state.state != "completed":
+            summarized_but_failed = (
+                with_summary_of_failed and state.state == "failed" and bool(state.overview)
+            )
+            if state.state != "completed" and not summarized_but_failed:
                 continue
             completed.append(
                 {
@@ -3406,6 +3496,7 @@ class Session:
         for archive in await self._get_completed_archive_refs(
             exclude_archive_uri,
             before_archive_index,
+            with_summary_of_failed=True,
         ):
             overview = await self._read_archive_overview(archive["archive_uri"])
             if not overview:

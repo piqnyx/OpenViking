@@ -338,7 +338,8 @@ async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_arch
     await stand.run(2, new, "t2")
 
     assert compressor.calls == [["u3", "a3", "u4", "a4", "u5", "a5"]]
-    assert [part for part, _overview in stand.summaries] == [["u5", "a5"]]
+    # PLAN-gorizont 3г: the next summary builds on the failed archive's finished WM.
+    assert stand.summaries == [(["u5", "a5"], "# WM after a4")]
     done = stand.storage.marker(archive(2), ".done")
     assert done["covered_failed_archives"] == ["archive_001"]
     assert (await stand.task("t2")).status == TaskStatus.COMPLETED
@@ -394,3 +395,71 @@ async def test_a_storm_inside_a_part_is_waited_out_and_the_part_is_marked_once(m
     assert (await stand.task("t1")).status == TaskStatus.COMPLETED
     done = stand.storage.marker(archive(1), ".done")
     assert done["completed_memory_steps"]["long_term"] == sorted(ids(FOUR_TURNS))
+
+
+# PLAN-gorizont 3г (Вит, 06.10): a written summary is a summary. An archive whose
+# working memory is complete but whose extraction failed feeds the context at once;
+# the extraction is finished later, in parts. The task says in words what was
+# done and what failed.
+
+
+@pytest.mark.asyncio
+async def test_a_written_summary_feeds_the_context_even_when_extraction_failed(monkeypatch):
+    compressor = _Compressor(limit=4, fail_on=lambda part: part == ["u3", "a3", "u4", "a4"])
+    stand = _Stand(monkeypatch, compressor=compressor, summary_limit=4)
+    stand.archive_with(1, FOUR_TURNS)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert (await stand.task("t1")).status == TaskStatus.FAILED
+    failed = stand.storage.marker(archive(1), ".failed.json")
+    assert failed["summary_complete"] is True
+    context = await stand.session._collect_session_context_components()
+    assert context["latest_archive"]["overview"] == "# WM after a4"
+    assert context["failed_archives"] == 1
+    assert await stand.session._get_latest_completed_archive_overview() == "# WM after a4"
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_summary_does_not_feed_the_context(monkeypatch):
+    stand = _Stand(
+        monkeypatch,
+        compressor=_Compressor(limit=8),
+        summary_heavy=lambda messages: "u3" in ids(messages),
+    )
+    stand.archive_with(1, FOUR_TURNS)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert (await stand.task("t1")).status == TaskStatus.FAILED
+    failed = stand.storage.marker(archive(1), ".failed.json")
+    assert failed["summary_complete"] is False
+    assert failed["completed_memory_steps"]["archive_summary"] == ["a1", "a2", "u1", "u2"]
+    context = await stand.session._collect_session_context_components()
+    assert context["latest_archive"] is None
+    assert await stand.session._get_latest_completed_archive_overview() == ""
+
+
+@pytest.mark.asyncio
+async def test_the_task_tells_what_was_done_and_what_failed(monkeypatch):
+    compressor = _Compressor(limit=4, fail_on=lambda part: part == ["u3", "a3", "u4", "a4"])
+    stand = _Stand(monkeypatch, compressor=compressor, summary_limit=4)
+    stand.archive_with(1, FOUR_TURNS)
+    stages = []
+    real_update_stage = stand.tracker.update_stage
+
+    async def remember(task_id, stage, **kwargs):
+        stages.append(stage)
+        await real_update_stage(task_id, stage, **kwargs)
+
+    monkeypatch.setattr(stand.tracker, "update_stage", remember)
+
+    await stand.run(1, FOUR_TURNS, "t1")
+
+    assert "working memory written" in stages
+    assert "long_term_memory_extraction: 4 of 8 messages done" in stages
+    task = await stand.task("t1")
+    assert task.status == TaskStatus.FAILED
+    assert task.error.startswith("working memory written; ")
+    assert "long_term_memory_extraction: 4 of 8 messages done" in task.error
+    assert "broken json" in task.error

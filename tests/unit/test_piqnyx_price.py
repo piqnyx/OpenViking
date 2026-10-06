@@ -106,15 +106,21 @@ class TestAskingTheHandle:
             ({"error": {"code": 400, "message": "the gate refuses this body"}}, 400),
         ],
     )
-    async def test_a_handle_that_cannot_answer_is_no_verdict(self, trouble, caplog):
-        # The step goes on without a price: the proxy's gate is still there.
+    async def test_a_handle_that_cannot_answer_is_no_verdict(self, trouble, monkeypatch):
+        # The step goes on without a price: the proxy's gate is still there. The
+        # warning is read off the module's logger itself: inside the image the
+        # package's logging is set up another way, and a capture through the root
+        # logger saw nothing there (06.10).
+        told = []
+        monkeypatch.setattr(
+            price.logger, "warning", lambda message, *args, **_: told.append(message % args)
+        )
         if isinstance(trouble, tuple):
             seen, client = _handle(trouble[0], trouble[1])
         else:
             seen, client = _handle(trouble)
-        with caplog.at_level("WARNING"):
-            assert await price.price(KWARGS, url="http://h/price", client=client) is None
-        assert any("price" in record.getMessage().lower() for record in caplog.records)
+        assert await price.price(KWARGS, url="http://h/price", client=client) is None
+        assert told and "price" in told[0].lower()
 
 
 class TestTheVerdict:

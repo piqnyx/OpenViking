@@ -300,3 +300,67 @@ def test_the_image_the_file_names_now_is_told(tmp_path, capsys):
 
     source.write_text(COMPOSE.replace("  openviking:", "  viking:"))
     assert edit_compose.main(given) == 1
+
+
+# ---------------------------------------------------- an earlier image of ours
+# PLAN-gorizont 3д: the second build replaces the first; the file then names an
+# image of ours, and that name is one of those the edit may find there.
+
+NAME = "piqnyx/openviking"
+NEXT = f"{NAME}:0.4.12-piqnyx.2"
+ON_OURS = COMPOSE.replace(
+    "    image: ghcr.io/volcengine/openviking:latest\n",
+    f"    image: {OURS}\n    pull_policy: never\n",
+)
+
+
+def test_an_earlier_image_of_ours_is_the_one_to_replace_when_our_name_is_among_the_names():
+    done = edit(ON_OURS, image=NEXT, was_of=[THEIRS, NAME])
+
+    assert done.changed and done.was == OURS
+    assert f"    image: {NEXT}\n    pull_policy: never\n" in done.text
+    assert done.text.count("pull_policy") == 1
+
+
+def test_an_earlier_image_of_ours_is_refused_when_only_their_name_is_given():
+    assert OURS in refused(ON_OURS, image=NEXT, was_of=THEIRS)
+
+
+def test_the_names_to_replace_may_be_one_or_many():
+    assert edit(was_of=THEIRS).changed
+    assert edit(was_of=[THEIRS]).changed
+    assert edit(was_of=[NAME, THEIRS]).changed
+
+
+def test_an_image_of_somebody_else_is_refused_with_every_name_told():
+    text = COMPOSE.replace("ghcr.io/volcengine/openviking:latest", "ghcr.io/other/openviking:1")
+
+    why = refused(text, image=NEXT, was_of=[THEIRS, NAME])
+
+    assert "ghcr.io/other/openviking:1" in why and THEIRS in why and NAME in why
+
+
+def test_the_command_takes_the_name_to_replace_more_than_once(tmp_path, capsys):
+    source = tmp_path / "docker-compose.yml"
+    source.write_text(ON_OURS)
+    out = tmp_path / "new.yml"
+
+    code = edit_compose.main(
+        [
+            "--file",
+            str(source),
+            "--service",
+            "openviking",
+            "--image",
+            NEXT,
+            "--was-of",
+            THEIRS,
+            "--was-of",
+            NAME,
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert code == 0, capsys.readouterr().out
+    assert f"    image: {NEXT}\n" in out.read_text()

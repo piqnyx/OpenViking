@@ -12,6 +12,12 @@
 # archive in work as failed when it is stopped), a copy of the compose file and
 # what the old container said are kept. A new server that does not get well in
 # time is taken away and the old one is brought back (PIQNYX.md, stage 2.6).
+#
+# The file may name the image we built on or an earlier image of ours (a second
+# build takes the place of the first, PLAN-gorizont 3д). The copy kept is always
+# the file before the latest replacement; an older copy is put aside, numbered
+# (`docker-compose.yml.before-piqnyx.1`, `.2`, ...). `--back` leads to the file
+# before the latest replacement.
 set -euo pipefail
 # shellcheck source=piqnyx/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -143,7 +149,8 @@ ours_id="$(id_of "$IMAGE")"
 rm -f "$new"
 edited=0
 python3 "$HERE/edit_compose.py" --file "$compose" --service "$SERVICE" \
-    --image "$IMAGE" --was-of "${BASE%%@*}" --out "$new" > "$work/edit.txt" || edited=$?
+    --image "$IMAGE" --was-of "${BASE%%@*}" --was-of "$NAME" --out "$new" > "$work/edit.txt" ||
+    edited=$?
 
 if [ "$edited" = "3" ]; then
     read -r image status health <<< "$(container)"
@@ -161,8 +168,17 @@ fi
 was="$(python3 "$HERE/edit_compose.py" --file "$compose" --service "$SERVICE" --image-now)"
 was_id="$(id_of "$was")"
 [ -n "$was_id" ] || stop "образа из compose-файла нет на диске: $was"
-[ "$was_id" = "$(id_of "$BASE")" ] ||
-    stop "образ в compose-файле не тот, на котором собран наш: $was"
+# An earlier image of ours in the file: the second build takes the place of the first.
+ours_before=0
+case "$was" in
+    "$NAME":*) ours_before=1 ;;
+esac
+if [ "$ours_before" = "1" ]; then
+    echo "в compose-файле наш прежний образ: $was"
+else
+    [ "$was_id" = "$(id_of "$BASE")" ] ||
+        stop "образ в compose-файле не тот, на котором собран наш: $was"
+fi
 
 state="$(container)"
 [ -n "$state" ] || stop "контейнера $CONTAINER нет: заменять нечего"
@@ -207,12 +223,19 @@ echo "== Проверка образа перед заменой"
 }
 tail -n 1 "$work/verify.txt"
 
-if [ -e "$kept" ]; then
-    cmp -s "$kept" "$compose" ||
+if [ -e "$kept" ] && ! cmp -s "$kept" "$compose"; then
+    if [ "$ours_before" = "1" ]; then
+        # The copy from the replacement before this one: put aside, numbered, so the
+        # kept copy is always the file before the latest replacement.
+        n=1
+        while [ -e "$kept.$n" ]; do n=$((n + 1)); done
+        mv "$kept" "$kept.$n"
+        echo "копия от прошлой замены отложена: $kept.$n"
+    else
         stop "копия от прошлого раза есть, и она другая: $kept. Сперва разобраться, какой файл верный"
-else
-    cp -p "$compose" "$kept"
+    fi
 fi
+[ -e "$kept" ] || cp -p "$compose" "$kept"
 
 in_compose "$new" config -q ||
     stop "docker не принял новый compose-файл, прежний не тронут: $new"

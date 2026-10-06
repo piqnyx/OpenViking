@@ -72,8 +72,10 @@ def _handle(answer, status=200):
         seen.append(json.loads(request.content))
         if isinstance(answer, Exception):
             raise answer
-        return httpx.Response(status, json=answer) if isinstance(answer, dict) else httpx.Response(
-            status, text=answer
+        return (
+            httpx.Response(status, json=answer)
+            if isinstance(answer, dict)
+            else httpx.Response(status, text=answer)
         )
 
     return seen, httpx.AsyncClient(transport=httpx.MockTransport(respond))
@@ -143,15 +145,26 @@ class TestTheDoorsOwnRefusal:
         assert price.door_refused_as_too_heavy(sdk_error(400, OVERFLOW_BODY)) is True
 
     def test_googles_own_overflow_wording_is_too_heavy(self):
-        body = {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message":
-                "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)."}}
+        body = {
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575).",
+            }
+        }
         assert price.door_refused_as_too_heavy(sdk_error(400, body)) is True
 
     def test_a_quota_refusal_is_not(self):
         assert price.door_refused_as_too_heavy(sdk_error(429, QUOTA_BODY)) is False
 
     def test_another_400_is_not(self):
-        body = {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "Request contains an invalid argument."}}
+        body = {
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "Request contains an invalid argument.",
+            }
+        }
         assert price.door_refused_as_too_heavy(sdk_error(400, body)) is False
 
     def test_the_numbers_are_read_off_the_refusal(self):

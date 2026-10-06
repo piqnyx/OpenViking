@@ -127,7 +127,7 @@
 нетронутом теге.
 
 ```
-python3 -m venv ovenv && ovenv/bin/pip install "openviking==0.4.12" pytest pytest-asyncio ruff
+python3 -m venv ovenv && ovenv/bin/pip install "openviking==0.4.12" pytest pytest-asyncio pytest-cov ruff
 ovenv/bin/python -m pytest tests/unit/test_piqnyx_persistence.py \
     tests/unit/session/test_piqnyx_phase2_until_cured.py -q --no-cov -p no:cacheprovider
 ```
@@ -211,6 +211,34 @@ ovenv/bin/python -m pytest tests/unit/test_piqnyx_persistence.py \
     `--back` возвращает прежний. Только по слову Вита.
   - [ ] 2.7. Уборка за собой (слова Вита: «чтоб не путаться и не плодить мусор»).
 - [ ] **3. Живая проверка.**
+- [x] **4. Вторая фаза частями, с оценкой ручкой прокси** (план «Горизонт до потолка»,
+  `gemini-proxy/PLAN-gorizont.md`, шаг 3б; решения Вита 06.10.2026). Ветка `piqnyx/phase2-parts`.
+  - `openviking/utils/piqnyx_price.py` (новый): адрес ручки из `OPENVIKING_PHASE2_PRICE_URL`
+    (умолчание `http://127.0.0.1:8787/price`, пустое значение -- оценка выключена); `price` шлёт
+    ручке тело как есть и отдаёт ответ как есть; ручка молчит, 5xx, не JSON -- вердикта нет, шаг
+    идёт, ворота прокси по-прежнему на месте; `fits` false -- `TooHeavyForTheDoor` с числами;
+    отказ двери в форме переполнения (Google: «The input token count (N) exceeds the maximum
+    number of tokens allowed (M)», с пометкой `[gemini-proxy]` или без) -- тот же вердикт.
+  - `openviking/models/vlm/backends/openai_vlm.py`, `get_completion_async`: оценка ровно того
+    тела, что уходит двери (`_build_text_kwargs`), до отправки; тяжёлое не уходит; отказ двери
+    не повторяется (быстрые повторы его не знают); шторм повторяется как раньше. Синхронный
+    `get_completion` не тронут: вторая фаза идёт асинхронно.
+  - `openviking/session/piqnyx_parts.py` (новый): `halves_by_turns` -- половины по целым ходам
+    (`retention.build_turns`: вопрос плюс всё до следующего вопроса, транспорт инструментов при
+    своём ходе); `run_in_parts` -- часть пробуется как есть, на вердикте режется пополам, половины
+    идут слева направо и режутся дальше; одиночный ход тяжелее потолка -- `TurnTooHeavy`,
+    постоянный провал шага, сделанные до него части остаются.
+  - `session.py`, вторая фаза: сводка и извлечение частями; повторы до победы -- внутри части;
+    сводка каждой части строится на WM предыдущей и пишет `.overview.md` после каждой; отметки
+    частей в `.meta.json` (`completed_memory_steps`, теперь и `archive_summary`), поэтому следующий
+    архив повторяет только недоделанное; о каждой резке -- строка в стадии задачи. С чекпоинтами
+    (частичные ходы) сводка идёт одним запросом, как в исходнике.
+  - `piqnyx_persistence.py`, `curable`: вердикт «тяжелее потолка» в обеих формах не лечится
+    ожиданием.
+  - Тесты вперёд (4 файла, 39 тестов): без кода не собираются; базовый набор форка на ветке и на
+    базе даёт один и тот же список падений (8 старых, 42 ошибки без Rust-библиотек).
+  - Не сделано здесь: статусы задачи по шагам и сводка проваленного архива в контексте (шаг 3г);
+    образ и замена контейнера (3д).
 
 ## Сборка образа (этап 2)
 

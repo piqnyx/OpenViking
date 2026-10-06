@@ -11,6 +11,7 @@ import pytest
 
 from openviking.models.vlm.backends import openai_vlm
 from openviking.models.vlm.backends.openai_vlm import OpenAIVLM
+from openviking.utils import model_retry
 from openviking.utils.piqnyx_price import TooHeavyForTheDoor
 
 OVERFLOW_BODY = {
@@ -72,7 +73,9 @@ def stand(monkeypatch, answers, verdict=None):
     )
     completions = _Completions(answers)
     monkeypatch.setattr(
-        vlm, "get_async_client", lambda: SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        vlm,
+        "get_async_client",
+        lambda: SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     priced = []
 
@@ -128,7 +131,7 @@ async def test_a_storm_is_still_repeated_as_before(monkeypatch):
     vlm, completions, _priced = stand(
         monkeypatch, [sdk_error(503, STORM_BODY), answer("ok")], {"fits": True}
     )
-    monkeypatch.setattr(openai_vlm.asyncio, "sleep", _no_time)
+    monkeypatch.setattr(model_retry.asyncio, "sleep", _no_time)
 
     assert await vlm.get_completion_async(prompt="hi") == "ok"
     assert len(completions.calls) == 2

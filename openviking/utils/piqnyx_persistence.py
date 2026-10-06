@@ -38,6 +38,7 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_UNKNOWN,
     classify_api_error,
 )
+from openviking.utils.piqnyx_price import TooHeavyForTheDoor, door_refused_as_too_heavy
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ ENV_BASE_SECONDS = "OPENVIKING_PHASE2_RETRY_BASE_SECONDS"
 ENV_MAX_SECONDS = "OPENVIKING_PHASE2_RETRY_MAX_SECONDS"
 
 # gemini-proxy refuses by itself a request heavier than one key's minute ceiling.
-# It wears the shape of a quota refusal, but no wait makes the request lighter.
+# Until 06.10.2026 it wore the shape of a quota refusal; since PLAN-gorizont 1б it
+# wears Google's overflow shape (`door_refused_as_too_heavy`). No wait makes the
+# request lighter: it is cut by turns instead (`piqnyx_parts`).
 _TOO_HEAVY_MARKERS = ("no key could serve it",)
 
 # The door will not serve the address the request left from. It comes as a 400,
@@ -85,6 +88,10 @@ def _chain(error: BaseException) -> List[BaseException]:
 def curable(error: BaseException) -> Optional[str]:
     """The kind of trouble waiting can cure, or None when waiting will not help."""
     chain = _chain(error)
+    if any(isinstance(item, TooHeavyForTheDoor) for item in chain):
+        return None
+    if door_refused_as_too_heavy(error):
+        return None
     texts = [str(item).lower() for item in chain]
 
     if any(marker in text for text in texts for marker in _TOO_HEAVY_MARKERS):

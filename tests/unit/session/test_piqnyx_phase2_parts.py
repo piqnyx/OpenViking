@@ -41,7 +41,16 @@ def ids(messages):
     return [m.id for m in messages]
 
 
-FOUR_TURNS = [user(1), assistant(1), user(2), assistant(2), user(3), assistant(3), user(4), assistant(4)]
+FOUR_TURNS = [
+    user(1),
+    assistant(1),
+    user(2),
+    assistant(2),
+    user(3),
+    assistant(3),
+    user(4),
+    assistant(4),
+]
 OVERFLOW_BODY = {
     "error": {
         "code": 400,
@@ -247,7 +256,11 @@ async def test_steps_too_heavy_are_done_in_halves_by_turns(monkeypatch):
 
     await stand.run(1, FOUR_TURNS, "t1")
 
-    assert stand.compressor.calls == [ids(FOUR_TURNS), ["u1", "a1", "u2", "a2"], ["u3", "a3", "u4", "a4"]]
+    assert stand.compressor.calls == [
+        ids(FOUR_TURNS),
+        ["u1", "a1", "u2", "a2"],
+        ["u3", "a3", "u4", "a4"],
+    ]
     # The summary is built part by part, each on the previous part's working memory.
     assert stand.summaries == [
         (ids(FOUR_TURNS), ""),
@@ -274,19 +287,27 @@ async def test_the_doors_own_refusal_cuts_the_part_like_the_handles_verdict(monk
 
     await stand.run(1, FOUR_TURNS, "t1")
 
-    assert stand.compressor.calls == [ids(FOUR_TURNS), ["u1", "a1", "u2", "a2"], ["u3", "a3", "u4", "a4"]]
+    assert stand.compressor.calls == [
+        ids(FOUR_TURNS),
+        ["u1", "a1", "u2", "a2"],
+        ["u3", "a3", "u4", "a4"],
+    ]
     assert stand.storage.marker(archive(1), ".done") is not None
 
 
 @pytest.mark.asyncio
-async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_archive_replays_the_rest(monkeypatch):
+async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_archive_replays_the_rest(
+    monkeypatch,
+):
     compressor = _Compressor(limit=4, fail_on=lambda part: part == ["u3", "a3", "u4", "a4"])
     stand = _Stand(monkeypatch, compressor=compressor, summary_limit=4)
     stand.archive_with(1, FOUR_TURNS)
 
-    with pytest.raises(ValueError, match="broken json"):
-        await stand.run(1, FOUR_TURNS, "t1")
+    # Phase 2 does not raise: it writes the failed marker and fails the task.
+    await stand.run(1, FOUR_TURNS, "t1")
 
+    first = await stand.task("t1")
+    assert first.status == TaskStatus.FAILED and "broken json" in (first.error or "")
     failed = stand.storage.marker(archive(1), ".failed.json")
     assert failed is not None
     assert failed["completed_memory_steps"]["long_term"] == ["a1", "a2", "u1", "u2"]
@@ -312,17 +333,19 @@ async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_arch
 
 
 @pytest.mark.asyncio
-async def test_a_single_turn_too_heavy_fails_the_step_for_good_and_keeps_the_parts_before(monkeypatch):
+async def test_a_single_turn_too_heavy_fails_the_step_for_good_and_keeps_the_parts_before(
+    monkeypatch,
+):
     compressor = _Compressor(heavy=lambda messages: "u3" in ids(messages))
     stand = _Stand(monkeypatch, compressor=compressor, summary_limit=8)
     stand.archive_with(1, FOUR_TURNS)
 
-    with pytest.raises(Exception) as trouble:
-        await stand.run(1, FOUR_TURNS, "t1")
+    await stand.run(1, FOUR_TURNS, "t1")
 
-    assert "turn" in str(trouble.value).lower()
+    task = await stand.task("t1")
+    assert task.status == TaskStatus.FAILED
+    assert "turn" in (task.error or "").lower()
     failed = stand.storage.marker(archive(1), ".failed.json")
     assert failed is not None
     assert failed["completed_memory_steps"]["long_term"] == ["a1", "a2", "u1", "u2"]
     assert ["u4", "a4"] not in compressor.calls
-    assert (await stand.task("t1")).status == TaskStatus.FAILED

@@ -27,7 +27,9 @@ def transport(i: str) -> Message:
     return Message(
         id=f"t{i}",
         role="user",
-        parts=[ToolPart(tool_name="read", tool_input="x", tool_output="y", tool_status="completed")],
+        parts=[
+            ToolPart(tool_name="read", tool_input="x", tool_output="y", tool_status="completed")
+        ],
     )
 
 
@@ -35,7 +37,16 @@ def ids(messages):
     return [m.id for m in messages]
 
 
-FOUR_TURNS = [user(1), assistant(1), user(2), assistant(2), user(3), assistant(3), user(4), assistant(4)]
+FOUR_TURNS = [
+    user(1),
+    assistant(1),
+    user(2),
+    assistant(2),
+    user(3),
+    assistant(3),
+    user(4),
+    assistant(4),
+]
 
 
 class TestHalvesByTurns:
@@ -45,7 +56,15 @@ class TestHalvesByTurns:
         assert ids(right) == ["u3", "a3", "u4", "a4"]
 
     def test_a_tool_transport_stays_with_its_turn(self):
-        messages = [user(1), assistant(1), transport(1), assistant("1b"), user(2), assistant(2), user(3)]
+        messages = [
+            user(1),
+            assistant(1),
+            transport(1),
+            assistant("1b"),
+            user(2),
+            assistant(2),
+            user(3),
+        ]
         left, right = parts.halves_by_turns(messages)
         assert ids(left) == ["u1", "a1", "t1", "a1b"]
         assert ids(right) == ["u2", "a2", "u3"]
@@ -105,7 +124,13 @@ class TestRunInParts:
         calls, run = heavy_when(2)
         await parts.run_in_parts(FOUR_TURNS, run)
         assert calls[0] == ids(FOUR_TURNS)
-        assert calls[-4:] == [["u1", "a1"], ["u2", "a2"], ["u3", "a3"], ["u4", "a4"]]
+        # The leaves, in order; the halves of four are tried (and refused) between them.
+        assert [part for part in calls if len(part) == 2] == [
+            ["u1", "a1"],
+            ["u2", "a2"],
+            ["u3", "a3"],
+            ["u4", "a4"],
+        ]
 
     @pytest.mark.asyncio
     async def test_a_single_turn_too_heavy_is_a_permanent_failure_with_the_parts_before_kept(self):

@@ -25,6 +25,7 @@ from openviking.session.memory.constants import (
     EXECUTION_MEMORY_TYPES,
 )
 from openviking.session.memory_policy import MemoryPolicy
+from openviking.session.piqnyx_parts import run_in_parts
 from openviking.session.retention import (
     RETENTION_MODE_TURN_BUDGET,
     RetentionPlan,
@@ -78,7 +79,30 @@ _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
 _MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS = 8.0
 _AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"cases", "trajectories"})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
-_MEMORY_STEP_NAMES = ("long_term", "execution")
+# piqnyx (PLAN-gorizont 3б): the summary keeps a mark of its own, part by part.
+_MEMORY_STEP_NAMES = ("long_term", "execution", "archive_summary")
+
+
+def _merge_step_results(results: List[Any]) -> Any:
+    """The results of a step's parts as one: dicts by their lists, lists end to end."""
+    if any(isinstance(result, dict) for result in results):
+        merged: Dict[str, Any] = {"contexts": [], "session_skills": []}
+        for result in results:
+            if isinstance(result, dict):
+                merged["contexts"].extend(result.get("contexts", []) or [])
+                merged["session_skills"].extend(result.get("session_skills", []) or [])
+                for key, value in result.items():
+                    if key not in ("contexts", "session_skills"):
+                        merged.setdefault(key, value)
+            elif result:
+                merged["contexts"].extend(list(result))
+        return merged
+    flat: List[Any] = []
+    for result in results:
+        flat.extend(list(result or []))
+    return flat
+
+
 _CUMULATIVE_CHECKPOINT_VERSION = 2
 
 
@@ -2283,49 +2307,99 @@ class Session:
                                 "(memory_policy.working_memory.enabled=false)"
                             )
                             return
-                        summary_kwargs: Dict[str, Any] = {
-                            "latest_archive_overview": latest_archive_overview,
-                        }
-                        if checkpoint_requests:
-                            summary_kwargs["checkpoint_requests"] = checkpoint_requests
-                        generated = await self._generate_archive_summary_async(
-                            extraction_messages,
-                            **summary_kwargs,
+                        # piqnyx (PLAN-gorizont 3б): the summary goes in parts the door
+                        # takes, each part on the working memory the part before it
+                        # left; every part done is marked in the archive's meta, so a
+                        # later attempt or archive skips it. Checkpoints bind to
+                        # messages across the whole input: with them, one request as
+                        # upstream does.
+                        done_before = completed_memory_steps.get("archive_summary", set())
+                        summary_messages = (
+                            list(extraction_messages)
+                            if checkpoint_requests
+                            else [m for m in extraction_messages if m.id not in done_before]
                         )
-                        summary_result = (
-                            generated
-                            if isinstance(generated, _ArchiveSummaryResult)
-                            else _ArchiveSummaryResult(overview=str(generated or ""))
-                        )
-                        checkpoint_records = self._build_checkpoint_records(
-                            checkpoint_requests,
-                            summary_result.checkpoint_summaries,
-                        )
-                        summary = summary_result.overview
-                        if checkpoint_requests and not summary.strip():
-                            raise ValueError(
-                                "Working Memory output is empty for a required checkpoint"
+                        current_overview = latest_archive_overview
+                        if done_before and not checkpoint_requests:
+                            written = await self._read_archive_overview(archive_uri)
+                            if written:
+                                current_overview = written
+                        if not summary_messages:
+                            logger.info("Working Memory summary already written for every message")
+                            return
+
+                        async def _summarize(part: List[Message]) -> None:
+                            nonlocal current_overview
+                            summary_kwargs: Dict[str, Any] = {
+                                "latest_archive_overview": current_overview,
+                            }
+                            if checkpoint_requests:
+                                summary_kwargs["checkpoint_requests"] = checkpoint_requests
+                            generated = await self._generate_archive_summary_async(
+                                part,
+                                **summary_kwargs,
                             )
-                        if self._viking_fs and summary:
-                            abstract = self._extract_abstract_from_summary(summary)
-                            await self._viking_fs.write_file(
-                                uri=f"{archive_uri}/.abstract.md",
-                                content=abstract,
-                                ctx=self.ctx,
+                            summary_result = (
+                                generated
+                                if isinstance(generated, _ArchiveSummaryResult)
+                                else _ArchiveSummaryResult(overview=str(generated or ""))
                             )
-                            await self._viking_fs.write_file(
-                                uri=f"{archive_uri}/.overview.md",
-                                content=summary,
-                                ctx=self.ctx,
+                            checkpoint_records = self._build_checkpoint_records(
+                                checkpoint_requests,
+                                summary_result.checkpoint_summaries,
+                            )
+                            summary = summary_result.overview
+                            if checkpoint_requests and not summary.strip():
+                                raise ValueError(
+                                    "Working Memory output is empty for a required checkpoint"
+                                )
+                            if self._viking_fs and summary:
+                                abstract = self._extract_abstract_from_summary(summary)
+                                await self._viking_fs.write_file(
+                                    uri=f"{archive_uri}/.abstract.md",
+                                    content=abstract,
+                                    ctx=self.ctx,
+                                )
+                                await self._viking_fs.write_file(
+                                    uri=f"{archive_uri}/.overview.md",
+                                    content=summary,
+                                    ctx=self.ctx,
+                                )
+                                await self._merge_archive_meta(
+                                    archive_uri,
+                                    {
+                                        "overview_tokens": estimate_text_tokens(summary),
+                                        "abstract_tokens": estimate_text_tokens(abstract),
+                                        "checkpoints": checkpoint_records,
+                                    },
+                                )
+                            if summary:
+                                current_overview = summary
+
+                        async def _mark_summary(part: List[Message], _result: Any) -> None:
+                            completed_memory_steps.setdefault("archive_summary", set()).update(
+                                message.id for message in part
                             )
                             await self._merge_archive_meta(
                                 archive_uri,
                                 {
-                                    "overview_tokens": estimate_text_tokens(summary),
-                                    "abstract_tokens": estimate_text_tokens(abstract),
-                                    "checkpoints": checkpoint_records,
+                                    "completed_memory_steps": (
+                                        self._serialize_completed_memory_steps(
+                                            completed_memory_steps
+                                        )
+                                    )
                                 },
                             )
+
+                        await run_in_parts(
+                            summary_messages,
+                            lambda part: _run_retryable_phase2_step(
+                                "archive_summary", lambda: _summarize(part)
+                            ),
+                            on_part_done=_mark_summary,
+                            on_split=_tell_of_the_cut("archive_summary"),
+                            operation="archive_summary",
+                        )
 
                     async def _run_retryable_phase2_step(
                         operation_name: str,
@@ -2385,28 +2459,56 @@ class Session:
                                 logger.warning("Could not update the task's stage: %s", trouble)
                         return result
 
+                    def _tell_of_the_cut(operation_name: str):
+                        async def tell(part: List[Message], heavy: Any) -> None:
+                            try:
+                                await tracker.update_stage(
+                                    task_id,
+                                    f"cutting {operation_name}: {len(part)} messages are too heavy "
+                                    f"for the door ({heavy}); halves by turns",
+                                    account_id=self.ctx.account_id,
+                                    user_id=self.ctx.user.user_id,
+                                )
+                            except Exception as trouble:
+                                logger.warning("Could not update the task's stage: %s", trouble)
+
+                        return tell
+
                     async def _run_recorded_memory_step(
                         operation_name: str,
                         step: str,
                         step_messages: List[Message],
-                        fn: Callable[[], Awaitable[Any]],
+                        fn: Callable[[List[Message]], Awaitable[Any]],
                     ) -> Any:
-                        result = await _run_retryable_phase2_step(operation_name, fn)
-                        completed_memory_steps.setdefault(step, set()).update(
-                            message.id for message in step_messages
+                        # piqnyx (PLAN-gorizont 3б): in parts the door takes. Each part
+                        # done is marked before the next one runs, so a process
+                        # restart, a sibling's failure or a later archive's replay
+                        # resumes without applying this memory step twice.
+                        async def _mark(part: List[Message], _result: Any) -> None:
+                            completed_memory_steps.setdefault(step, set()).update(
+                                message.id for message in part
+                            )
+                            await self._merge_archive_meta(
+                                archive_uri,
+                                {
+                                    "completed_memory_steps": (
+                                        self._serialize_completed_memory_steps(
+                                            completed_memory_steps
+                                        )
+                                    )
+                                },
+                            )
+
+                        results = await run_in_parts(
+                            step_messages,
+                            lambda part: _run_retryable_phase2_step(
+                                operation_name, lambda: fn(part)
+                            ),
+                            on_part_done=_mark,
+                            on_split=_tell_of_the_cut(operation_name),
+                            operation=operation_name,
                         )
-                        # Persist progress before waiting for sibling Phase 2
-                        # tasks. A process restart or a sibling failure can then
-                        # resume without applying this memory step twice.
-                        await self._merge_archive_meta(
-                            archive_uri,
-                            {
-                                "completed_memory_steps": (
-                                    self._serialize_completed_memory_steps(completed_memory_steps)
-                                )
-                            },
-                        )
-                        return result
+                        return _merge_step_results(results)
 
                     # Summary, long-term memory, and execution-derived memory run concurrently.
                     memory_extraction_enabled = ov_config.memory.extraction_enabled
@@ -2472,20 +2574,18 @@ class Session:
                         extraction_tasks: List[Any] = []
                         extraction_labels: List[str] = []
                         if working_memory_enabled:
-                            extraction_tasks.append(
-                                _run_retryable_phase2_step("archive_summary", _run_archive_summary)
-                            )
+                            extraction_tasks.append(_run_archive_summary())
                             extraction_labels.append("archive_summary")
 
                         if long_term_has_work:
 
-                            async def _run_long_term_memory_extraction() -> Any:
+                            async def _run_long_term_memory_extraction(part: List[Message]) -> Any:
                                 # strict_extract_errors=True lets transient failures
                                 # surface so _run_retryable_phase2_step can retry them
                                 # (and so a final failure is recorded as a skipped
                                 # archive instead of silently dropping the memory).
                                 return await self._session_compressor.extract_long_term_memories(
-                                    messages=long_term_messages,
+                                    messages=part,
                                     user=self.user,
                                     session_id=self.session_id,
                                     ctx=self.ctx,
@@ -2510,11 +2610,11 @@ class Session:
 
                         if has_execution_memory and execution_memory_has_work:
 
-                            async def _run_execution_memory_extraction() -> Any:
+                            async def _run_execution_memory_extraction(part: List[Message]) -> Any:
                                 # See _run_long_term_memory_extraction: surface errors
                                 # so retries can engage and final failures are visible.
                                 return await self._session_compressor.extract_execution_memories(
-                                    messages=execution_messages,
+                                    messages=part,
                                     ctx=self.ctx,
                                     strict_extract_errors=True,
                                     latest_archive_overview=latest_archive_overview,
@@ -2601,12 +2701,7 @@ class Session:
                                 "Memory and session skill extraction skipped "
                                 "(disabled by config or memory_policy)"
                             )
-                        if working_memory_enabled:
-                            await _run_retryable_phase2_step(
-                                "archive_summary", _run_archive_summary
-                            )
-                        else:
-                            await _run_archive_summary()
+                        await _run_archive_summary()
 
                     # Write relations (using snapshot, not self._usage_records)
                     if self._viking_fs:

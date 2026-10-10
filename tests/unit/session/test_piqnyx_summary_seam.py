@@ -170,13 +170,17 @@ _LINE = re.compile(r"\[(user|assistant)\]: (?:question|answer) (\d+)")
 class _Door:
     """The model behind the config, as the summary sees it: it reads the messages back
     out of the rendered prompt and refuses the weight the way the handle does. Asked
-    with the update tool it answers with a tool call that updates one section, or,
-    told ``tool_answer="none"``, with no tool call at all."""
+    with a tool forced on it answers with the tool call -- the working memory with the
+    checkpoint notes the prompt marks, or one section updated -- unless told to be
+    flaky (no tool call, so many times) or to answer without the tool at all. Told
+    what to refuse, it refuses the content the way a moderation answer does."""
 
-    def __init__(self, *, limit=8, heavy=None, tool_answer="ops"):
+    def __init__(self, *, limit=8, heavy=None, tool_answer="ops", flaky=0, refuse=None):
         self.limit = limit
         self.heavy = heavy or (lambda found, prompt, tools: len(found) > self.limit)
         self.tool_answer = tool_answer
+        self.flaky = flaky
+        self.refuse = refuse
         self.calls = []
         self.prompts = []
 
@@ -190,18 +194,32 @@ class _Door:
         self.prompts.append(prompt or "")
         if self.heavy(found, prompt or "", bool(tools)):
             raise TooHeavyForTheDoor(len(prompt or "") * 10, self.limit * 1000, "handle")
+        if self.refuse is not None and self.refuse(found, prompt or ""):
+            raise RuntimeError("the door refused it: content policy violation")
         last = found[-1] if found else "?"
         if tools:
-            if self.tool_answer == "none":
+            if self.flaky > 0 or self.tool_answer == "none":
+                self.flaky = max(0, self.flaky - 1)
                 return SimpleNamespace(
                     has_tool_calls=False, tool_calls=[], finish_reason="stop", usage={}
                 )
-            ops = {
-                "sections": {"Current State": {"op": "UPDATE", "content": f"state after {last}"}}
-            }
+            notes = [
+                f"note {index} after {last}"
+                for index in range((prompt or "").count("<checkpoint_source index="))
+            ]
+            if tools[0]["function"]["name"] == "create_working_memory":
+                args = {"working_memory": f"WM after {last}", "checkpoint_summaries": notes}
+            else:
+                args = {
+                    "sections": {
+                        "Current State": {"op": "UPDATE", "content": f"state after {last}"}
+                    }
+                }
+                if notes:
+                    args["checkpoint_summaries"] = notes
             return SimpleNamespace(
                 has_tool_calls=True,
-                tool_calls=[SimpleNamespace(arguments=json.dumps(ops))],
+                tool_calls=[SimpleNamespace(arguments=json.dumps(args))],
                 finish_reason="tool_calls",
                 usage={},
             )
@@ -231,6 +249,28 @@ def completed_archive(stand, index, messages, overview):
     stand.storage.files[f"{uri}/.overview.md"] = overview
     stand.storage.files[f"{uri}/.summary.done"] = json.dumps({"written_at": 0})
     return uri
+
+
+def partial_turn(stand, index, older, anchor, sources):
+    """An archive the server cut inside a turn: the older turns, a copy of the retained
+    user message (the anchor) and the archived prefix of its answer (the sources), with
+    the retention plan that asks Phase 2 for a checkpoint note of that prefix."""
+    messages = [*older, anchor, *sources]
+    uri = stand.archive_with(index, messages)
+    stand.storage.files[f"{uri}/.meta.json"] = json.dumps(
+        {
+            "retention_plan": {
+                "mode": "turn_budget",
+                "partial_turn": True,
+                "turn_anchor_message_id": anchor.id,
+                "checkpoint_source_message_ids": [message.id for message in sources],
+                "retained_message_token_budget": 1000,
+                "estimated_active_tokens": 100,
+                "budget_exceeded": False,
+            }
+        }
+    )
+    return messages
 
 
 def fetched(i, output) -> Message:
@@ -364,12 +404,12 @@ async def test_one_turn_too_heavy_goes_into_the_summary_with_its_tool_outputs_as
 
 
 @pytest.mark.asyncio
-async def test_one_turn_too_heavy_with_nothing_to_lighten_is_skipped_and_the_rest_summarized(
+async def test_one_turn_too_heavy_with_nothing_to_lighten_is_cut_by_messages_and_by_text(
     monkeypatch,
 ):
     # The weight sits in the words themselves, not in a tool's output: there is no
-    # lighter form, the turn is skipped and counted done, the turns around it are
-    # summarized, and the meta says which turn and why.
+    # lighter form, so the turn is cut by messages, the heavy message by its text, as
+    # deep as it takes; every piece goes into the summary and nothing is left out.
     wall = Message(id="u2", role="user", parts=[TextPart("question 2 " + "y" * 30000)])
     turns = [
         user(1),
@@ -386,24 +426,24 @@ async def test_one_turn_too_heavy_with_nothing_to_lighten_is_skipped_and_the_res
     )
     stand.archive_with(1, turns)
     await stand.run(1, turns, "t1")
-    assert [found for found, _tools in stand.door.calls] == [
-        ids(turns),
-        ["u1", "a1", "u2", "a2"],
-        ["u1", "a1"],
-        ["u2", "a2"],
-        ["u3", "a3", "u4", "a4"],
-    ]
     assert stand.storage.files[f"{archive(1)}/.overview.md"] == "WM after a4"
+    pieces = [
+        prompt for prompt in stand.prompts_of() if "yyyy" in prompt and "question 2" not in prompt
+    ]
+    assert len(pieces) >= 4, len(pieces)
     done = stand.storage.marker(archive(1), ".done")
     assert done["completed_memory_steps"]["archive_summary"] == sorted(ids(turns))
     meta = stand.storage.marker(archive(1), ".meta.json")
-    assert [(record["step"], record["message_ids"]) for record in meta["skipped_turns"]] == [
-        ("archive_summary", ["u2", "a2"])
-    ]
+    assert "refused_messages" not in meta and "skipped_turns" not in meta
     assert any(
-        stage.startswith("skipping archive_summary: one turn alone (2 messages, first u2)")
+        stage.startswith(
+            "cutting archive_summary inside one turn (2 messages, first u2): halves by messages"
+        )
         for stage in stand.stages
     ), stand.stages
+    assert any("message u2 in two pieces by its text" in stage for stage in stand.stages), (
+        stand.stages
+    )
     assert (await stand.task("t1")).status == TaskStatus.COMPLETED
 
 
@@ -474,3 +514,78 @@ async def test_the_creation_fallback_after_an_answer_without_a_tool_call_is_cut_
     ]
     assert stand.storage.files[f"{archive(2)}/.overview.md"] == "WM after a8"
     assert (await stand.task("t2")).status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_rides_with_the_part_that_holds_its_sources(monkeypatch):
+    # The server cut the archive inside a turn: Phase 2 owes a checkpoint note of the
+    # archived prefix. Too heavy as a whole, the input is cut by turns as any other; the
+    # note is asked of the part that holds the prefix, the other parts go without, and
+    # the record lands in the meta as it would from one request.
+    stand = _Stand(monkeypatch, door=_Door(limit=4))
+    messages = partial_turn(stand, 1, FOUR_TURNS, user(5), [assistant(5)])
+    await stand.run(1, messages, "t1")
+    assert stand.door.calls == [
+        (ids(messages), True),
+        (["u1", "a1", "u2", "a2"], False),
+        (["u3", "a3", "u4", "a4", "u5", "a5"], True),
+        (["u3", "a3"], False),
+        (["u4", "a4", "u5", "a5"], True),
+    ]
+    assert stand.storage.files[f"{archive(1)}/.overview.md"] == "WM after a5"
+    meta = stand.storage.marker(archive(1), ".meta.json")
+    assert [
+        (r["turn_anchor_message_id"], r["source_message_ids"], r["abstract"])
+        for r in meta["checkpoints"]
+    ] == [("u5", ["a5"], "note 0 after a5")]
+    done = stand.storage.marker(archive(1), ".done")
+    assert done["completed_memory_steps"]["archive_summary"] == sorted(ids(messages))
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_cannot_be_used_is_asked_again_before_anything_else(monkeypatch):
+    # The model answers the forced tool call without the tool call, twice; the third
+    # answer is right. Asked again at once, as a passing failure, not a refusal.
+    stand = _Stand(monkeypatch, door=_Door(flaky=2))
+    messages = partial_turn(stand, 1, [user(1), assistant(1)], user(2), [assistant(2)])
+    await stand.run(1, messages, "t1")
+    assert [tools for _found, tools in stand.door.calls] == [True, True, True]
+    assert stand.storage.files[f"{archive(1)}/.overview.md"] == "WM after a2"
+    meta = stand.storage.marker(archive(1), ".meta.json")
+    assert [r["abstract"] for r in meta["checkpoints"]] == ["note 0 after a2"]
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_a_message_refused_for_its_content_is_left_out_with_a_record(monkeypatch):
+    # The door refuses the content of one answer (a moderation answer). The part is cut
+    # down to that one message, it is left out with a record in the meta and the task's
+    # stage, and everything around it is summarized.
+    poisoned = Message(id="a3", role="assistant", parts=[TextPart("answer 3 POISON")])
+    turns = [user(1), assistant(1), user(2), assistant(2), user(3), poisoned, user(4), assistant(4)]
+    stand = _Stand(monkeypatch, door=_Door(refuse=lambda found, prompt: "POISON" in prompt))
+    stand.archive_with(1, turns)
+    await stand.run(1, turns, "t1")
+    assert [found for found, _tools in stand.door.calls] == [
+        ids(turns),
+        ["u1", "a1", "u2", "a2"],
+        ["u3", "a3", "u4", "a4"],
+        ["u3", "a3"],
+        ["u3"],
+        ["a3"],
+        ["u4", "a4"],
+    ]
+    assert stand.storage.files[f"{archive(1)}/.overview.md"] == "WM after a4"
+    meta = stand.storage.marker(archive(1), ".meta.json")
+    assert [(r["step"], r["message_id"]) for r in meta["refused_messages"]] == [
+        ("archive_summary", "a3")
+    ]
+    assert "content policy" in meta["refused_messages"][0]["reason"]
+    done = stand.storage.marker(archive(1), ".done")
+    assert done["completed_memory_steps"]["archive_summary"] == sorted(ids(turns))
+    assert any(
+        stage.startswith("archive_summary: message a3 refused by the door")
+        for stage in stand.stages
+    ), stand.stages
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED

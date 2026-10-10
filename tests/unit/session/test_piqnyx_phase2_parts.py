@@ -205,7 +205,9 @@ def config_of_its_own(monkeypatch, tmp_path):
 
 
 class _Stand:
-    def __init__(self, monkeypatch, *, compressor, summary_limit=8, summary_heavy=None):
+    def __init__(
+        self, monkeypatch, *, compressor, summary_limit=8, summary_heavy=None, summary_fail_on=None
+    ):
         self.storage = _Storage()
         self.storage.files[f"{URI}/.meta.json"] = json.dumps({"session_id": "s1"})
         self.compressor = compressor
@@ -220,6 +222,9 @@ class _Stand:
 
         async def summary(messages, latest_archive_overview="", **kwargs):
             self.summaries.append((ids(messages), latest_archive_overview))
+            if summary_fail_on is not None and summary_fail_on(messages):
+                # Trouble of the model's own making: nothing to cut, nothing to wait for.
+                raise ValueError("broken json from the model")
             if heavy(messages):
                 raise TooHeavyForTheDoor(len(messages) * 1000, summary_limit * 1000, "handle")
             return f"# WM after {ids(messages)[-1]}"
@@ -351,22 +356,45 @@ async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_arch
 
 
 @pytest.mark.asyncio
-async def test_a_single_turn_too_heavy_fails_the_step_for_good_and_keeps_the_parts_before(
-    monkeypatch,
-):
+async def test_a_single_turn_too_heavy_is_skipped_and_the_rest_goes_on(monkeypatch):
+    # PLAN-gorizont 3ж: one turn alone above the ceiling cannot be cut, and the
+    # extraction has no lighter form of it: the turn is skipped and counted done, the
+    # parts after it run, the meta says which turn and why, and the archive does not
+    # fail for good over one turn.
     compressor = _Compressor(heavy=lambda messages: "u3" in ids(messages))
     stand = _Stand(monkeypatch, compressor=compressor, summary_limit=8)
     stand.archive_with(1, FOUR_TURNS)
+    stages = []
+    real_update_stage = stand.tracker.update_stage
+
+    async def remember(task_id, stage, **kwargs):
+        stages.append(stage)
+        await real_update_stage(task_id, stage, **kwargs)
+
+    monkeypatch.setattr(stand.tracker, "update_stage", remember)
 
     await stand.run(1, FOUR_TURNS, "t1")
 
-    task = await stand.task("t1")
-    assert task.status == TaskStatus.FAILED
-    assert "turn" in (task.error or "").lower()
-    failed = stand.storage.marker(archive(1), ".failed.json")
-    assert failed is not None
-    assert failed["completed_memory_steps"]["long_term"] == ["a1", "a2", "u1", "u2"]
-    assert ["u4", "a4"] not in compressor.calls
+    assert (await stand.task("t1")).status == TaskStatus.COMPLETED
+    assert compressor.calls == [
+        ids(FOUR_TURNS),
+        ["u1", "a1", "u2", "a2"],
+        ["u3", "a3", "u4", "a4"],
+        ["u3", "a3"],
+        ["u4", "a4"],
+    ]
+    done = stand.storage.marker(archive(1), ".done")
+    assert done["completed_memory_steps"]["long_term"] == sorted(ids(FOUR_TURNS))
+    meta = stand.storage.marker(archive(1), ".meta.json")
+    assert [(record["step"], record["message_ids"]) for record in meta["skipped_turns"]] == [
+        ("long_term_memory_extraction", ["u3", "a3"])
+    ]
+    assert any(
+        stage.startswith(
+            "skipping long_term_memory_extraction: one turn alone (2 messages, first u3)"
+        )
+        for stage in stages
+    ), stages
 
 
 @pytest.mark.asyncio
@@ -430,7 +458,10 @@ async def test_an_unfinished_summary_does_not_feed_the_context(monkeypatch):
     stand = _Stand(
         monkeypatch,
         compressor=_Compressor(limit=8),
-        summary_heavy=lambda messages: "u3" in ids(messages),
+        # PLAN-gorizont 3ж: a turn too heavy on its own is skipped now, not failed; what
+        # leaves a summary unfinished is trouble of the model's own making in a part.
+        summary_limit=4,
+        summary_fail_on=lambda messages: "u3" in ids(messages) and len(messages) <= 4,
     )
     stand.archive_with(1, FOUR_TURNS)
 
@@ -553,7 +584,10 @@ async def test_an_unfinished_summary_leaves_no_mark(monkeypatch):
     stand = _Stand(
         monkeypatch,
         compressor=_Compressor(limit=8),
-        summary_heavy=lambda messages: "u3" in ids(messages),
+        # PLAN-gorizont 3ж: a turn too heavy on its own is skipped now, not failed; what
+        # leaves a summary unfinished is trouble of the model's own making in a part.
+        summary_limit=4,
+        summary_fail_on=lambda messages: "u3" in ids(messages) and len(messages) <= 4,
     )
     stand.archive_with(1, FOUR_TURNS)
 

@@ -148,7 +148,9 @@ class TestRunInParts:
 
         with pytest.raises(parts.TurnTooHeavy) as too_heavy:
             await parts.run_in_parts(FOUR_TURNS, run, on_part_done=record)
-        assert too_heavy.value.message_ids == ["u3", "a3"]
+        # PLAN-gorizont 3ж: the turn was cut by messages, the message by text, and a
+        # piece of ten characters still refused is the ceiling's fault, not the data's.
+        assert too_heavy.value.message_ids == ["u3"]
         assert "300000" in str(too_heavy.value) and "249000" in str(too_heavy.value)
         # The half before the heavy turn was done and recorded; nothing after it ran.
         assert done == [["u1", "a1", "u2", "a2"]]
@@ -172,3 +174,178 @@ class TestRunInParts:
 
         await parts.run_in_parts(FOUR_TURNS, run, on_split=on_split)
         assert told == [(8, 8000, 4000)]
+
+
+def chars_of(part):
+    return sum(parts.piece_chars(message) for message in part)
+
+
+def takes_chars(limit: int):
+    """A step that the door takes only when the part carries at most `limit` characters."""
+    calls = []
+
+    async def run(part):
+        calls.append([(message.id, parts.piece_chars(message)) for message in part])
+        weight = chars_of(part)
+        if weight > limit:
+            raise TooHeavyForTheDoor(weight, limit, "handle")
+        return weight
+
+    return calls, run
+
+
+class TestCutInsideATurn:
+    # PLAN-gorizont 3ж: a single turn too heavy on its own is cut by messages, a
+    # message by its text, as deep as it takes; nothing is left out.
+
+    def test_a_message_of_several_parts_is_cut_by_its_parts_first(self):
+        message = Message(
+            id="a1",
+            role="assistant",
+            parts=[
+                TextPart("answer 1"),
+                ToolPart(tool_name="read", tool_output="y" * 8, tool_status="completed"),
+            ],
+        )
+        left, right = parts.halves_by_text(message)
+        assert [part.type for part in left.parts] == ["text"]
+        assert [part.type for part in right.parts] == ["tool"]
+        assert left.id == right.id == "a1"
+        assert parts.piece_chars(message) == 16
+
+    def test_a_message_of_one_part_is_cut_by_its_text(self):
+        left, right = parts.halves_by_text(user(1))
+        assert left.parts[0].text + right.parts[0].text == "question 1"
+        assert left.id == right.id == "u1"
+        assert parts.halves_by_text(Message(id="x", role="user", parts=[])) is None
+        assert parts.halves_by_text(Message(id="x", role="user", parts=[TextPart("a")])) is None
+
+    @pytest.mark.asyncio
+    async def test_a_turn_too_heavy_is_cut_by_messages_then_by_text(self, monkeypatch):
+        monkeypatch.setattr(parts, "SMALLEST_PIECE_CHARS", 2)
+        calls, run = takes_chars(6)
+        done = []
+        told = []
+
+        async def record(part, result):
+            done.append((ids(part), result))
+
+        async def inside(part, how, _heavy):
+            told.append((how, ids(part)))
+
+        results = await parts.run_in_parts(
+            [user(1), assistant(1)], run, on_part_done=record, on_cut_inside=inside
+        )
+        # The turn (18 characters) is refused; by messages: "question 1" (10) is refused and
+        # goes in two pieces of five, "answer 1" (8) in two pieces of four.
+        assert calls == [
+            [("u1", 10), ("a1", 8)],
+            [("u1", 10)],
+            [("u1", 5)],
+            [("u1", 5)],
+            [("a1", 8)],
+            [("a1", 4)],
+            [("a1", 4)],
+        ]
+        assert results == [5, 5, 4, 4]
+        # A message cut by text counts done once, after its last piece.
+        assert done == [(["u1"], None), (["a1"], None)]
+        assert told == [("messages", ["u1", "a1"]), ("text", ["u1"]), ("text", ["a1"])]
+
+    @pytest.mark.asyncio
+    async def test_a_piece_at_the_floor_still_too_heavy_is_the_ceilings_fault(self, monkeypatch):
+        monkeypatch.setattr(parts, "SMALLEST_PIECE_CHARS", 4)
+
+        async def run(_part):
+            raise TooHeavyForTheDoor(1, 0, "handle")
+
+        with pytest.raises(parts.TurnTooHeavy) as too_heavy:
+            await parts.run_in_parts([user(1)], run)
+        assert too_heavy.value.message_ids == ["u1"]
+
+    @pytest.mark.asyncio
+    async def test_the_lighter_form_is_tried_before_cutting_inside(self):
+        calls, run = takes_chars(12)
+        heavy = Message(
+            id="a1",
+            role="assistant",
+            parts=[ToolPart(tool_name="read", tool_output="y" * 40, tool_status="completed")],
+        )
+        told = []
+
+        async def inside(part, how, _heavy):
+            told.append(how)
+
+        def lighter(part):
+            light = [Message.from_dict(message.to_dict()) for message in part]
+            light[1].parts[0].tool_output = "yy"
+            return light
+
+        results = await parts.run_in_parts(
+            [user(1), heavy], run, lighter=lighter, on_cut_inside=inside
+        )
+        assert calls == [[("u1", 10), ("a1", 40)], [("u1", 10), ("a1", 2)]]
+        assert results == [12] and told == ["lighter"]
+
+
+class TestRefusedForContent:
+    # PLAN-gorizont 3ж: a part the door refuses for its content is cut down to the one
+    # message that earned it; that message is left out with a record, the others go on.
+
+    @pytest.mark.asyncio
+    async def test_a_refused_part_is_cut_down_to_the_one_message_refused(self):
+        calls = []
+        done = []
+        left_out = []
+
+        async def run(part):
+            calls.append(ids(part))
+            if "a3" in ids(part):
+                raise ValueError("content policy violation")
+            return "ok"
+
+        async def record(part, _result):
+            done.append(ids(part))
+
+        async def on_refused(message, error):
+            left_out.append((message.id, str(error)))
+
+        results = await parts.run_in_parts(
+            FOUR_TURNS,
+            run,
+            on_part_done=record,
+            refused=lambda error: "content policy" in str(error),
+            on_refused=on_refused,
+        )
+        assert calls == [
+            ids(FOUR_TURNS),
+            ["u1", "a1", "u2", "a2"],
+            ["u3", "a3", "u4", "a4"],
+            ["u3", "a3"],
+            ["u3"],
+            ["a3"],
+            ["u4", "a4"],
+        ]
+        assert left_out == [("a3", "content policy violation")]
+        # The refused message counts done too: it is not to be replayed.
+        assert done == [["u1", "a1", "u2", "a2"], ["u3"], ["a3"], ["u4", "a4"]]
+        assert results == ["ok", "ok", "ok"]
+
+    @pytest.mark.asyncio
+    async def test_more_refusals_than_the_cap_fail_the_step(self):
+        async def run(_part):
+            raise ValueError("content policy violation")
+
+        with pytest.raises(parts.RefusedBeyondMeasure) as beyond:
+            await parts.run_in_parts(FOUR_TURNS, run, refused=lambda _error: True)
+        assert len(beyond.value.message_ids) == parts.REFUSED_CAP + 1
+
+    @pytest.mark.asyncio
+    async def test_other_trouble_is_not_a_refusal(self):
+        async def run(_part):
+            raise ValueError("broken json")
+
+        with pytest.raises(ValueError, match="broken json"):
+            await parts.run_in_parts(
+                FOUR_TURNS, run, refused=lambda error: "content policy" in str(error)
+            )

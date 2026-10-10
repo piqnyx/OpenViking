@@ -356,12 +356,11 @@ async def test_a_part_that_fails_for_good_keeps_the_parts_done_and_the_next_arch
 
 
 @pytest.mark.asyncio
-async def test_a_single_turn_too_heavy_is_skipped_and_the_rest_goes_on(monkeypatch):
-    # PLAN-gorizont 3ж: one turn alone above the ceiling cannot be cut, and the
-    # extraction has no lighter form of it: the turn is skipped and counted done, the
-    # parts after it run, the meta says which turn and why, and the archive does not
-    # fail for good over one turn.
-    compressor = _Compressor(heavy=lambda messages: "u3" in ids(messages))
+async def test_a_single_turn_too_heavy_is_cut_by_messages_and_the_rest_goes_on(monkeypatch):
+    # PLAN-gorizont 3ж: one turn alone above the ceiling cannot be cut by turns, and the
+    # extraction has no lighter form of it: the turn is cut by messages, each message
+    # goes on its own, the parts after it run, and nothing is left out.
+    compressor = _Compressor(heavy=lambda messages: "u3" in ids(messages) and len(messages) > 1)
     stand = _Stand(monkeypatch, compressor=compressor, summary_limit=8)
     stand.archive_with(1, FOUR_TURNS)
     stages = []
@@ -381,17 +380,18 @@ async def test_a_single_turn_too_heavy_is_skipped_and_the_rest_goes_on(monkeypat
         ["u1", "a1", "u2", "a2"],
         ["u3", "a3", "u4", "a4"],
         ["u3", "a3"],
+        ["u3"],
+        ["a3"],
         ["u4", "a4"],
     ]
     done = stand.storage.marker(archive(1), ".done")
     assert done["completed_memory_steps"]["long_term"] == sorted(ids(FOUR_TURNS))
     meta = stand.storage.marker(archive(1), ".meta.json")
-    assert [(record["step"], record["message_ids"]) for record in meta["skipped_turns"]] == [
-        ("long_term_memory_extraction", ["u3", "a3"])
-    ]
+    assert "refused_messages" not in meta and "skipped_turns" not in meta
     assert any(
         stage.startswith(
-            "skipping long_term_memory_extraction: one turn alone (2 messages, first u3)"
+            "cutting long_term_memory_extraction inside one turn (2 messages, first u3): "
+            "halves by messages"
         )
         for stage in stages
     ), stages

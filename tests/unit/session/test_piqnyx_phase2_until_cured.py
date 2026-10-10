@@ -149,10 +149,15 @@ def config_of_its_own(monkeypatch, tmp_path):
 
 
 class _Stand:
-    def __init__(self, monkeypatch, *, memory_failures=(), summary_failures=()):
+    def __init__(self, monkeypatch, *, memory_failures=(), summary_failures=(), messages=None):
         self.storage = _Storage()
-        self.message = Message(id="m1", role="user", parts=[TextPart("hello")])
-        self.storage.files[f"{ARCHIVE}/messages.jsonl"] = self.message.to_jsonl() + "\n"
+        self.messages = list(messages or ()) or [
+            Message(id="m1", role="user", parts=[TextPart("hello")])
+        ]
+        self.message = self.messages[0]
+        self.storage.files[f"{ARCHIVE}/messages.jsonl"] = "".join(
+            message.to_jsonl() + "\n" for message in self.messages
+        )
         self.storage.files[f"{URI}/.meta.json"] = json.dumps({"session_id": "s1"})
         self.compressor = _Compressor(memory_failures)
         self.session = Session(
@@ -197,10 +202,10 @@ class _Stand:
             await self.session._run_memory_extraction(
                 task_id="t1",
                 archive_uri=ARCHIVE,
-                messages=[self.message],
+                messages=self.messages,
                 usage_records=[],
-                first_message_id="m1",
-                last_message_id="m1",
+                first_message_id=self.messages[0].id,
+                last_message_id=self.messages[-1].id,
                 memory_policy=None,
             )
         finally:
@@ -274,6 +279,36 @@ async def test_the_summary_is_repeated_too_and_the_memory_is_not_extracted_twice
 
 
 async def test_what_waiting_does_not_cure_fails_the_archive_as_before(monkeypatch):
+    # A 400 on every request: nothing to wait for. PLAN-gorizont 3ж cuts the part to find
+    # the message that earned the refusal, and a refusal on every single message is not
+    # the content's doing: the step fails with the door's words, the archive as before.
+    turns = [
+        Message(id=f"{role}{i}", role=role, parts=[TextPart(f"{role} {i}")])
+        for i in range(1, 5)
+        for role in ("user", "assistant")
+    ]
+    stand = _Stand(monkeypatch, memory_failures=[Exception(MALFORMED)] * 40, messages=turns)
+    waits = []
+
+    async def clock(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(persistence, "_sleep", clock)
+
+    await stand.run()
+
+    assert stand.compressor.calls >= 4
+    assert waits == []
+    assert stand.storage.markers() == [".failed.json"]
+    failed = json.loads(stand.storage.files[f"{ARCHIVE}/.failed.json"])
+    assert failed["stage"] == "memory_extraction"
+    assert "invalid argument" in failed["error"]
+    assert (await stand.task()).status == TaskStatus.FAILED
+
+
+async def test_a_refusal_of_one_request_is_cut_out_and_the_archive_completes(monkeypatch):
+    # PLAN-gorizont 3ж: the door refuses once (a 400 on the whole), the halves pass: the
+    # refusal was the content's, it is isolated, and the archive completes.
     stand = _Stand(monkeypatch, memory_failures=[Exception(MALFORMED)])
     waits = []
 
@@ -286,11 +321,8 @@ async def test_what_waiting_does_not_cure_fails_the_archive_as_before(monkeypatc
 
     assert stand.compressor.calls == 1
     assert waits == []
-    assert stand.storage.markers() == [".failed.json"]
-    failed = json.loads(stand.storage.files[f"{ARCHIVE}/.failed.json"])
-    assert failed["stage"] == "memory_extraction"
-    assert "invalid argument" in failed["error"]
-    assert (await stand.task()).status == TaskStatus.FAILED
+    assert stand.storage.markers() == [".done"]
+    assert (await stand.task()).status == TaskStatus.COMPLETED
 
 
 async def test_a_stop_in_the_middle_of_a_wait_leaves_the_archive_pending(monkeypatch):

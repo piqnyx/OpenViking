@@ -31,7 +31,9 @@ import os
 from typing import Any, Awaitable, Callable, List, Optional, Tuple, TypeVar
 
 from openviking.utils.model_retry import (
+    _PERMANENT_IO_ERRORS,
     ERROR_CLASS_AUTH,
+    ERROR_CLASS_CONTENT_SAFETY,
     ERROR_CLASS_PERMANENT,
     ERROR_CLASS_QUOTA_EXCEEDED,
     ERROR_CLASS_TRANSIENT,
@@ -168,6 +170,31 @@ def queue_survives_a_stop(read_config: Callable[[], Any]) -> bool:
     except Exception:
         return False
     return isinstance(backend, str) and backend.strip().lower() in ("sqlite", "sqlite3")
+
+
+class UnusableAnswer(ValueError):
+    """The model answered, and the answer could not be used: no tool call where one was
+    forced, arguments of the wrong shape, an empty required field. Not the door's doing:
+    repeated a few times at once, then a refusal of that content (PLAN-gorizont 3ж)."""
+
+
+def refused_for_its_content(error: BaseException) -> bool:
+    """Whether a step failed over the request's own content: a moderation refusal, a 400
+    that is not a weight, or an answer of the model's that could not be used. Cutting the
+    part isolates it and waiting cannot cure it. A weight is cut by weight instead; a file
+    error or a bug of ours is nobody's content and goes up as it is (PLAN-gorizont 3ж)."""
+    chain = _chain(error)
+    if any(isinstance(item, UnusableAnswer) for item in chain):
+        return True
+    if any(isinstance(item, (TooHeavyForTheDoor, *_PERMANENT_IO_ERRORS)) for item in chain):
+        return False
+    if door_refused_as_too_heavy(error):
+        return False
+    texts = [str(item).lower() for item in chain]
+    if any(marker in text for text in texts for marker in _TOO_HEAVY_MARKERS):
+        return False
+    error_class = classify_api_error(error)  # type: ignore[arg-type]
+    return error_class in (ERROR_CLASS_CONTENT_SAFETY, ERROR_CLASS_PERMANENT)
 
 
 async def until_cured(

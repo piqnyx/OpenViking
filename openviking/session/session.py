@@ -1497,6 +1497,8 @@ class Session:
         archive_uri: str,
         updates: Dict[str, Any],
         lease_ref: Optional[Any] = None,
+        *,
+        append_to: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Merge archive metadata so Phase 2 cannot erase Phase 1 planning data."""
         if not self._viking_fs:
@@ -1514,6 +1516,11 @@ class Session:
             except Exception:
                 pass
             meta.update(updates)
+            # piqnyx (PLAN-gorizont 3ж): a record appended to a list field under the same
+            # lock, so two steps skipping turns at once lose none of their records.
+            for key, record in (append_to or {}).items():
+                existing = meta.get(key)
+                meta[key] = (list(existing) if isinstance(existing, list) else []) + [record]
             await self._viking_fs.write_file(
                 uri=f"{archive_uri}/.meta.json",
                 content=json.dumps(meta, ensure_ascii=False),
@@ -2432,6 +2439,8 @@ class Session:
                             ),
                             on_part_done=_mark_summary,
                             on_split=_tell_of_the_cut("archive_summary"),
+                            lighter=self._summary_lighter,
+                            on_turn_skipped=_tell_of_the_skip("archive_summary"),
                             operation="archive_summary",
                         )
                         summary_complete = True
@@ -2516,6 +2525,32 @@ class Session:
 
                         return tell
 
+                    def _tell_of_the_skip(operation_name: str):
+                        # piqnyx (PLAN-gorizont 3ж): one turn alone above the ceiling, even
+                        # in its lighter form, is skipped and counted done rather than
+                        # failing the archive for good; the archive keeps it whole, and
+                        # the meta says which turn and why.
+                        async def tell(part: List[Message], heavy: Any) -> None:
+                            first = part[0].id if part else "?"
+                            await _tell_stage(
+                                f"skipping {operation_name}: one turn alone ({len(part)} messages, "
+                                f"first {first}) is too heavy for the door ({heavy}); its "
+                                f"messages stay in the archive"
+                            )
+                            await self._merge_archive_meta(
+                                archive_uri,
+                                {},
+                                append_to={
+                                    "skipped_turns": {
+                                        "step": operation_name,
+                                        "message_ids": [message.id for message in part],
+                                        "reason": str(heavy),
+                                    }
+                                },
+                            )
+
+                        return tell
+
                     async def _run_recorded_memory_step(
                         operation_name: str,
                         step: str,
@@ -2556,6 +2591,7 @@ class Session:
                             ),
                             on_part_done=_mark,
                             on_split=_tell_of_the_cut(operation_name),
+                            on_turn_skipped=_tell_of_the_skip(operation_name),
                             operation=operation_name,
                         )
                         return _merge_step_results(results)
@@ -4256,6 +4292,33 @@ class Session:
         first_line = summary.split("\n")[0].strip()
         return first_line if first_line else ""
 
+    def _summary_lighter(self, messages: List[Message]) -> Optional[List[Message]]:
+        """The part with every tool output longer than the externalization preview cut to
+        such a preview -- what the archive itself keeps of it -- for one turn that is too
+        heavy for the summary on its own (PLAN-gorizont 3ж). None when nothing is longer:
+        there is nothing to lighten, and the turn is skipped instead."""
+        preview_chars = max(1, int(self._tool_output_externalization_config.preview_chars))
+        lighter = [Message.from_dict(message.to_dict()) for message in messages]
+        changed = False
+        for message in lighter:
+            for part in message.parts:
+                if not isinstance(part, ToolPart):
+                    continue
+                output = part.tool_output or ""
+                if len(output) <= preview_chars:
+                    continue
+                part.tool_output = make_preview(
+                    output,
+                    preview_chars=preview_chars,
+                    ref=part.tool_output_ref or "",
+                    tool_name=part.tool_name or "",
+                    reason="too heavy for the summary",
+                    original_chars=part.tool_output_original_chars or len(output),
+                    mime_type=part.tool_output_mime_type or "text/plain",
+                )
+                changed = True
+        return lighter if changed else None
+
     @staticmethod
     def _format_message_for_wm(m: Message) -> str:
         """Format a single message for WM generation, including all parts.
@@ -4454,15 +4517,15 @@ class Session:
                     )
                 return await vlm.get_completion_async(prompt)
             except Exception as e:
+                # piqnyx (PLAN-gorizont 3ж): nothing is swallowed here. What the door or
+                # the handle refused goes up to the step: a passing failure is repeated,
+                # a storm waited out, a weight above the ceiling cut by turns, a failure
+                # for good marks the archive -- instead of a stub standing as the working
+                # memory and the cut never running. The stub stays only where there is no
+                # model to ask.
                 _wm_debug(f"creation failed: {e}")
                 logger.warning(f"WM creation failed: {e}")
-                if checkpoint_requests:
-                    raise
-                turn_count = len([m for m in messages if is_user_query(m)])
-                return (
-                    f"# Session Summary\n\n"
-                    f"**Overview**: {turn_count} turns, {len(messages)} messages"
-                )
+                raise
 
         # -------- Branch 2: has prior WM v2 -> tool_call incremental update --------
         _wm_debug(f"branch=UPDATE (prior WM={len(latest_archive_overview)}B)")
@@ -4491,12 +4554,11 @@ class Session:
             import traceback as _tb
 
             _wm_debug(f"tool_call raised: {type(e).__name__}: {e} tb={_tb.format_exc()[-400:]}")
-            if checkpoint_requests:
-                raise
-            logger.warning("WM update tool_call failed (%s); falling back to creation prompt", e)
-            return await self._fallback_generate_wm_creation(
-                formatted, messages, latest_archive_overview
-            )
+            # piqnyx (PLAN-gorizont 3ж): the call itself failed, not the model's answer;
+            # the creation prompt would carry the same weight to the same door. Up to the
+            # step, which repeats, waits, cuts or marks the archive.
+            logger.warning("WM update call failed (%s)", e)
+            raise
 
         has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
         _preview = (str(resp)[:200]).replace(chr(10), " ")
@@ -4656,11 +4718,9 @@ class Session:
             )
             return await get_openviking_config().vlm.get_completion_async(prompt)
         except Exception as e:
+            # piqnyx (PLAN-gorizont 3ж): up to the step, as in the two branches above.
             logger.warning(f"WM creation fallback failed: {e}")
-            turn_count = len([m for m in messages if is_user_query(m)])
-            return (
-                f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
-            )
+            raise
 
     @staticmethod
     def _parse_wm_sections(text: str) -> Dict[str, str]:

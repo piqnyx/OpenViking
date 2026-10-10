@@ -48,7 +48,12 @@ from openviking.session.tool_result_synopsis import (
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.model_retry import is_retryable_api_error, retry_async
-from openviking.utils.piqnyx_persistence import queue_survives_a_stop, until_cured
+from openviking.utils.piqnyx_persistence import (
+    UnusableAnswer,
+    queue_survives_a_stop,
+    refused_for_its_content,
+    until_cured,
+)
 from openviking.utils.time_utils import get_current_timestamp
 from openviking.utils.token_estimation import estimate_text_tokens, truncate_text_to_token_budget
 from openviking_cli.exceptions import (
@@ -2346,20 +2351,19 @@ class Session:
                                 "(memory_policy.working_memory.enabled=false)"
                             )
                             return
-                        # piqnyx (PLAN-gorizont 3б): the summary goes in parts the door
+                        # piqnyx (PLAN-gorizont 3б, 3ж): the summary goes in parts the door
                         # takes, each part on the working memory the part before it
                         # left; every part done is marked in the archive's meta, so a
-                        # later attempt or archive skips it. Checkpoints bind to
-                        # messages across the whole input: with them, one request as
-                        # upstream does.
+                        # later attempt or archive skips it. A checkpoint (a partial
+                        # turn's archived prefix) rides with the part that holds its
+                        # source messages; cut across parts, its note grows part by
+                        # part through checkpoint_previous, as it does across archives.
                         done_before = completed_memory_steps.get("archive_summary", set())
-                        summary_messages = (
-                            list(extraction_messages)
-                            if checkpoint_requests
-                            else [m for m in extraction_messages if m.id not in done_before]
-                        )
+                        summary_messages = [
+                            m for m in extraction_messages if m.id not in done_before
+                        ]
                         current_overview = latest_archive_overview
-                        if done_before and not checkpoint_requests:
+                        if done_before:
                             written = await self._read_archive_overview(archive_uri)
                             if written:
                                 current_overview = written
@@ -2368,14 +2372,59 @@ class Session:
                             summary_complete = True
                             await self._write_summary_mark(archive_uri)
                             return
+                        # The checkpoint notes written so far, by anchor: a rerun after a
+                        # crash keeps the records of the parts already done.
+                        records_by_anchor: Dict[str, Dict[str, Any]] = {}
+                        for record in (await self._read_archive_meta(archive_uri)).get(
+                            "checkpoints"
+                        ) or []:
+                            if isinstance(record, dict) and isinstance(
+                                record.get("turn_anchor_message_id"), str
+                            ):
+                                records_by_anchor[record["turn_anchor_message_id"]] = record
+
+                        def _requests_for(part: List[Message]) -> List[_CheckpointRequest]:
+                            part_ids = {message.id for message in part}
+                            local: List[_CheckpointRequest] = []
+                            for request in checkpoint_requests:
+                                sources = tuple(
+                                    source_id
+                                    for source_id in request.source_message_ids
+                                    if source_id in part_ids
+                                )
+                                if not sources:
+                                    continue
+                                written = records_by_anchor.get(request.turn_anchor_message_id)
+                                local.append(
+                                    _CheckpointRequest(
+                                        turn_anchor_message_id=request.turn_anchor_message_id,
+                                        source_message_ids=sources,
+                                        retained_message_token_budget=(
+                                            request.retained_message_token_budget
+                                        ),
+                                        estimated_active_tokens=request.estimated_active_tokens,
+                                        previous_checkpoint_abstract=(
+                                            str(written.get("abstract") or "")
+                                            if written
+                                            else request.previous_checkpoint_abstract
+                                        ),
+                                        previous_checkpoint_source_message_ids=(
+                                            tuple(written.get("source_message_ids") or ())
+                                            if written
+                                            else request.previous_checkpoint_source_message_ids
+                                        ),
+                                    )
+                                )
+                            return local
 
                         async def _summarize(part: List[Message]) -> None:
                             nonlocal current_overview
+                            requests_here = _requests_for(part)
                             summary_kwargs: Dict[str, Any] = {
                                 "latest_archive_overview": current_overview,
                             }
-                            if checkpoint_requests:
-                                summary_kwargs["checkpoint_requests"] = checkpoint_requests
+                            if requests_here:
+                                summary_kwargs["checkpoint_requests"] = requests_here
                             generated = await self._generate_archive_summary_async(
                                 part,
                                 **summary_kwargs,
@@ -2386,12 +2435,14 @@ class Session:
                                 else _ArchiveSummaryResult(overview=str(generated or ""))
                             )
                             checkpoint_records = self._build_checkpoint_records(
-                                checkpoint_requests,
+                                requests_here,
                                 summary_result.checkpoint_summaries,
                             )
+                            for record in checkpoint_records:
+                                records_by_anchor[record["turn_anchor_message_id"]] = record
                             summary = summary_result.overview
-                            if checkpoint_requests and not summary.strip():
-                                raise ValueError(
+                            if requests_here and not summary.strip():
+                                raise UnusableAnswer(
                                     "Working Memory output is empty for a required checkpoint"
                                 )
                             if self._viking_fs and summary:
@@ -2411,7 +2462,7 @@ class Session:
                                     {
                                         "overview_tokens": estimate_text_tokens(summary),
                                         "abstract_tokens": estimate_text_tokens(abstract),
-                                        "checkpoints": checkpoint_records,
+                                        "checkpoints": list(records_by_anchor.values()),
                                     },
                                 )
                             if summary:
@@ -2440,7 +2491,9 @@ class Session:
                             on_part_done=_mark_summary,
                             on_split=_tell_of_the_cut("archive_summary"),
                             lighter=self._summary_lighter,
-                            on_turn_skipped=_tell_of_the_skip("archive_summary"),
+                            on_cut_inside=_tell_of_the_cut_inside("archive_summary"),
+                            refused=refused_for_its_content,
+                            on_refused=_tell_of_the_refusal("archive_summary"),
                             operation="archive_summary",
                         )
                         summary_complete = True
@@ -2462,7 +2515,12 @@ class Session:
                                 max_retries=_MEMORY_EXTRACTION_MAX_RETRIES,
                                 base_delay=_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
                                 max_delay=_MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
-                                is_retryable=is_retryable_api_error,
+                                # piqnyx (PLAN-gorizont 3ж): an answer that could not be
+                                # used is a thing to ask again, a few times at once.
+                                is_retryable=lambda error: (
+                                    is_retryable_api_error(error)
+                                    or isinstance(error, UnusableAnswer)
+                                ),
                                 logger=logger,
                                 operation_name=operation_name,
                             )
@@ -2525,26 +2583,40 @@ class Session:
 
                         return tell
 
-                    def _tell_of_the_skip(operation_name: str):
-                        # piqnyx (PLAN-gorizont 3ж): one turn alone above the ceiling, even
-                        # in its lighter form, is skipped and counted done rather than
-                        # failing the archive for good; the archive keeps it whole, and
-                        # the meta says which turn and why.
-                        async def tell(part: List[Message], heavy: Any) -> None:
+                    def _tell_of_the_cut_inside(operation_name: str):
+                        # piqnyx (PLAN-gorizont 3ж): a single turn above the ceiling goes on
+                        # being cut -- its lighter form, halves by messages, a message by
+                        # its text -- and every cut is told.
+                        async def tell(part: List[Message], how: str, heavy: Any) -> None:
                             first = part[0].id if part else "?"
+                            words = {
+                                "lighter": "tool outputs as previews",
+                                "messages": "halves by messages",
+                                "text": f"message {first} in two pieces by its text",
+                            }.get(how, how)
                             await _tell_stage(
-                                f"skipping {operation_name}: one turn alone ({len(part)} messages, "
-                                f"first {first}) is too heavy for the door ({heavy}); its "
-                                f"messages stay in the archive"
+                                f"cutting {operation_name} inside one turn ({len(part)} messages, "
+                                f"first {first}): {words}; too heavy for the door ({heavy})"
+                            )
+
+                        return tell
+
+                    def _tell_of_the_refusal(operation_name: str):
+                        # piqnyx (PLAN-gorizont 3ж): one message the door refuses for its
+                        # content is left out with a record; the archive keeps it whole.
+                        async def tell(message: Message, error: Any) -> None:
+                            await _tell_stage(
+                                f"{operation_name}: message {message.id} refused by the door "
+                                f"({error}); left out, it stays in the archive"
                             )
                             await self._merge_archive_meta(
                                 archive_uri,
                                 {},
                                 append_to={
-                                    "skipped_turns": {
+                                    "refused_messages": {
                                         "step": operation_name,
-                                        "message_ids": [message.id for message in part],
-                                        "reason": str(heavy),
+                                        "message_id": message.id,
+                                        "reason": str(error),
                                     }
                                 },
                             )
@@ -2591,7 +2663,9 @@ class Session:
                             ),
                             on_part_done=_mark,
                             on_split=_tell_of_the_cut(operation_name),
-                            on_turn_skipped=_tell_of_the_skip(operation_name),
+                            on_cut_inside=_tell_of_the_cut_inside(operation_name),
+                            refused=refused_for_its_content,
+                            on_refused=_tell_of_the_refusal(operation_name),
                             operation=operation_name,
                         )
                         return _merge_step_results(results)
@@ -3941,7 +4015,7 @@ class Session:
     ) -> List[Dict[str, Any]]:
         """Bind ordinal LLM outputs to server-owned IDs and enforce local budgets."""
         if len(summaries) != len(requests):
-            raise ValueError(
+            raise UnusableAnswer(
                 "Working Memory output returned "
                 f"{len(summaries)} checkpoint summaries for {len(requests)} requests"
             )
@@ -3950,7 +4024,7 @@ class Session:
         for request, raw_summary in zip(requests, summaries, strict=True):
             summary = raw_summary.strip() if isinstance(raw_summary, str) else ""
             if not summary:
-                raise ValueError("Working Memory output contains an empty checkpoint summary")
+                raise UnusableAnswer("Working Memory output contains an empty checkpoint summary")
 
             configured_budget = request.retained_message_token_budget
             if configured_budget > 0:
@@ -3962,7 +4036,7 @@ class Session:
                 checkpoint_budget = 1024
             abstract = truncate_text_to_token_budget(summary, max(1, checkpoint_budget))
             if not abstract:
-                raise ValueError("Checkpoint summary is empty after local token truncation")
+                raise UnusableAnswer("Checkpoint summary is empty after local token truncation")
             records.append(
                 {
                     "checkpoint_version": _CUMULATIVE_CHECKPOINT_VERSION,
@@ -4406,9 +4480,9 @@ class Session:
     ) -> tuple[str, ...]:
         raw = args.get("checkpoint_summaries")
         if not isinstance(raw, list):
-            raise ValueError("tool_call arguments.checkpoint_summaries missing")
+            raise UnusableAnswer("tool_call arguments.checkpoint_summaries missing")
         if len(raw) != request_count or not all(isinstance(item, str) for item in raw):
-            raise ValueError(
+            raise UnusableAnswer(
                 f"tool_call checkpoint_summaries must contain exactly {request_count} strings"
             )
         return tuple(raw)
@@ -4497,17 +4571,17 @@ class Session:
                         getattr(response, "has_tool_calls", False)
                         and getattr(response, "tool_calls", None)
                     ):
-                        raise ValueError(
+                        raise UnusableAnswer(
                             "Working Memory creation returned no create_working_memory tool call"
                         )
                     args = response.tool_calls[0].arguments
                     if isinstance(args, str):
                         args = json.loads(args)
                     if not isinstance(args, dict):
-                        raise ValueError("create_working_memory arguments must be an object")
+                        raise UnusableAnswer("create_working_memory arguments must be an object")
                     working_memory = args.get("working_memory")
                     if not isinstance(working_memory, str) or not working_memory.strip():
-                        raise ValueError("create_working_memory.working_memory is empty")
+                        raise UnusableAnswer("create_working_memory.working_memory is empty")
                     return _ArchiveSummaryResult(
                         overview=working_memory,
                         checkpoint_summaries=self._parse_required_checkpoint_summaries(
@@ -4571,7 +4645,7 @@ class Session:
 
         if not has_tc:
             if checkpoint_requests:
-                raise ValueError("Working Memory update returned no tool call for checkpoints")
+                raise UnusableAnswer("Working Memory update returned no tool call for checkpoints")
             logger.warning("WM update: LLM returned no tool_call; falling back to creation prompt")
             return await self._fallback_generate_wm_creation(
                 formatted, messages, latest_archive_overview
